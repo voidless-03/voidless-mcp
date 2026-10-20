@@ -20,6 +20,14 @@
     "node": ">=18"
   },
   "homepage": "https://voidless.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voidless-03/voidless-mcp.git",
+    "directory": "server"
+  },
+  "bugs": {
+    "url": "https://github.com/voidless-03/voidless-mcp/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -29,20 +37,12 @@
     "gamedev",
     "ai"
   ],
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "pngjs": "^7.0.0",
     "undici": "^6.29.0"
-  },
-  "scripts": {
-    "start": "node index.js"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/voidless-03/voidless-mcp.git",
-    "directory": "server"
-  },
-  "bugs": {
-    "url": "https://github.com/voidless-03/voidless-mcp/issues"
   }
 }
