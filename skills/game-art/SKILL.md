@@ -43,7 +43,7 @@ credit cost.
 - **Into HTML, Phaser or a sandbox:** `get_image_data` returns an image, or an animation as one
   sprite strip, as a data URI with a CSS snippet. Code sandboxes often can't download from
   voidless.dev, so use it instead of URLs there.
-- **Sound:** `generate_sfx` for effects (coin, jump, hit), `generate_music` for loops (30–120 s).
+- **Sound and music:** see the `sound` skill (`generate_sfx`, `generate_music`).
 - **3D:** `generate_3d_model`, then `rig_3d_model` (humanoids) and `animate_3d_model`.
 
 ## Tag as you go

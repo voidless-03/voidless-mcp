@@ -1,8 +1,16 @@
 # Voidless for coding agents
 
-Game art from Claude Code, Cursor, Codex or any MCP client: sprites, 8-direction turns, animation
-sets, tilesets, UI, sound effects, music and 3D models. Every clip in a set keeps the same size and
-palette, with the feet on the same line, so it drops into a game without cleanup.
+Art, animation, sound effects and music for your game, made from Claude Code, Cursor, Codex or any
+MCP client:
+
+- **Art:** sprites, characters, props, tilesets, UI and backdrops, pixel art or painted
+- **Animation:** 8-direction turns and whole animation sets (walk, run, attack, idle, jump, hurt, death)
+- **Sound:** sound effects from a description (coin, jump, hit, footsteps, UI clicks)
+- **Music:** loops of 30–120 seconds with tempo and key, for title screens, levels and battles
+- **3D:** models you can rig and animate
+
+Every clip in a set keeps the same size and palette, with the feet on the same line, so it drops into
+a game without cleanup.
 
 ![Two knights, animated, with a backdrop and sound, made through the Voidless MCP server, then a game written around them](docs/demo.gif)
 
@@ -41,6 +49,7 @@ Then ask for what you need:
 | `game-art` | Which settings to use for sprites, props, backdrops and UI; credit rules |
 | `character-set` | One sprite → 8-way turn → animation sets (top-down or platformer) |
 | `tileset` | Platformer, wang and blob tilesets, and setting them up in Godot |
+| `sound` | Sound effects and music loops, and wiring them into Godot or Phaser |
 | `godot-import` | Downloads every clip and writes a SpriteFrames `.tres` for AnimatedSprite2D ([script](skills/godot-import/scripts/voidless-godot.mjs)) |
 
 ## Other clients
