@@ -1,0 +1,15 @@
+{
+  "name": "voidless",
+  "description": "Voidless game-art tools and skills for Claude Code.",
+  "owner": {
+    "name": "Voidless Dev Inc.",
+    "email": "contact@voidless.dev"
+  },
+  "plugins": [
+    {
+      "name": "voidless",
+      "source": "./",
+      "description": "Game art from your coding agent: sprites, 8-direction turns, animation sets, tilesets, sound and 3D, with skills for character sets and Godot import."
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "voidless": {
+      "type": "http",
+      "url": "https://mcp.voidless.dev/mcp"
+    }
+  }
+}

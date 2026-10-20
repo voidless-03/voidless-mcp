@@ -1,0 +1,14 @@
+{
+  "name": "voidless",
+  "version": "1.0.0",
+  "description": "Game art from your coding agent: sprites, 8-direction turns, animation sets, tilesets, sound, music and 3D models from Voidless, plus skills to build a character set and import it into Godot.",
+  "author": {
+    "name": "Voidless Dev Inc.",
+    "email": "contact@voidless.dev",
+    "url": "https://voidless.dev"
+  },
+  "homepage": "https://voidless.dev/mcp",
+  "repository": "https://github.com/voidless-03/voidless-mcp",
+  "license": "MIT",
+  "keywords": ["gamedev", "sprites", "pixel-art", "animation", "godot", "mcp", "game-assets"]
+}
