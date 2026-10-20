@@ -25,7 +25,7 @@ import { Agent, setGlobalDispatcher } from "undici";
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.6.7";
+export const VERSION = "1.6.8";
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -920,12 +920,12 @@ export function createVoidlessServer(API_KEY) {
 
   server.tool(
     "generate_3d_model",
-    "Generate a 3D model (GLB) from a prompt. 15 credits (lq) or 25 (hq).",
+    "Generate a 3D model (GLB) from a prompt. 15 credits (lq) or 60 (hq).",
     {
       prompt: z.string().describe("The model to make"),
       type: z.enum(["object", "character"]).default("object").describe("'character' makes a T-posed figure ready for rigging"),
       style: z.string().default("cartoon style").describe("e.g. 'cartoon style', 'low-poly', 'realistic'"),
-      mode: z.enum(["lq", "hq"]).default("hq").describe("lq = fast draft, hq = detailed"),
+      mode: z.enum(["lq", "hq"]).default("hq").describe("lq = fast draft (15 credits), hq = detailed (60 credits)"),
       bodyType: z.enum(["humanoid", "quadruped"]).default("humanoid").describe("Characters only"),
       seed: z.number().int().min(0).default(0),
     },

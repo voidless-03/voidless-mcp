@@ -53,6 +53,18 @@ Claude Code:
 claude mcp add voidless -e VOIDLESS_API_KEY=void_... -- npx -y voidless-mcp
 ```
 
+### Claude Code plugin
+
+The hosted connector plus skills for character sets, tilesets and Godot import
+([source](https://github.com/voidless-03/voidless-mcp)):
+
+```
+/plugin marketplace add voidless-03/voidless-mcp
+/plugin install voidless@voidless
+```
+
+Or just the hosted connector, no key: `claude mcp add --transport http voidless https://mcp.voidless.dev/mcp`
+
 ## Tools
 
 **Your library** (free, read-only)
