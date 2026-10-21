@@ -43,6 +43,7 @@ Then ask for what you need:
 - "Import asset 115918 into this Godot project and set up the player."
 - "Make a grass-and-dirt-path wang tileset in the same palette."
 - "A coin pickup sound and a 60-second chiptune loop for the title screen."
+- "Clean up this walk cycle from another tool and give me 64px pixel-art frames: <link to the mp4>."
 
 | Skill | What it does |
 |---|---|
@@ -51,6 +52,7 @@ Then ask for what you need:
 | `tileset` | Platformer, wang and blob tilesets, and setting them up in Godot |
 | `sound` | Sound effects and music loops, and wiring them into Godot or Phaser |
 | `godot-import` | Downloads every clip and writes a SpriteFrames `.tres` for AnimatedSprite2D ([script](skills/godot-import/scripts/voidless-godot.mjs)) |
+| `game-ready` | Cleans up art made elsewhere: background removed, pixel art on a real grid, a 1-5 s clip to 16 frames (`clean_up_sprite`, `pixelate_image`) |
 
 ## Other clients
 

@@ -1,7 +1,7 @@
 {
   "name": "voidless",
-  "version": "1.0.0",
-  "description": "Sprites, animation, sound effects and music for your game, from your coding agent: 8-direction animation sets, tilesets, SFX, music loops and 3D models from Voidless, with skills for character sets, sound and Godot import.",
+  "version": "1.1.0",
+  "description": "Sprites, animation, sound effects and music for your game, from your coding agent: 8-direction animation sets, tilesets, SFX, music loops and 3D models from Voidless, with skills for character sets, sound, Godot import and cleaning up art made elsewhere.",
   "author": {
     "name": "Voidless Dev Inc.",
     "email": "contact@voidless.dev",
