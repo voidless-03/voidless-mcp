@@ -91,7 +91,8 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | `rotate_sprite` | An 8-way set (front, back, sides, diagonals) in one pass |
 | `extract_parts` | Split a character into body parts for rigging |
 | `upload_image` | Add an image you already have to your library |
-| `pixelate_image` | Convert any image to pixel art |
+| `pixelate_image` | Convert any image to pixel art (32 to 1024 px) |
+| `clean_up_sprite` | Make a sprite or a 1-5 s animation from anywhere game-ready: background removed, pixel art on a real grid, stray pixels fixed; videos come back as 16 frames |
 
 **Animation**
 

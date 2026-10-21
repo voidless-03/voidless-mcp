@@ -25,7 +25,7 @@ import { Agent, setGlobalDispatcher } from "undici";
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.6.8";
+export const VERSION = "1.6.9";
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -46,7 +46,7 @@ const GALLERY_MIME = "text/html;profile=mcp-app";
 const GALLERY_TOOLS = [
   "generate_image", "upload_image", "edit_image", "rotate_sprite", "animate_sprite", "generate_animation_set",
   "flip_left_side", "generate_video", "generate_sfx", "generate_music", "generate_3d_model", "get_asset",
-  "list_assets", "extract_parts", "pixelate_image", "extend_video",
+  "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite",
 ];
 const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "utf8");
 
@@ -620,9 +620,9 @@ export function createVoidlessServer(API_KEY) {
         ),
       dimension: z.enum(["2d", "top down", "isometric"]).default("2d").describe("'2d' = side view, 'top down' = overhead, 'isometric' = 2.5D"),
       size: z
-        .union([z.literal(32), z.literal(64), z.literal(128), z.literal(512), z.literal(1024)])
+        .union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)])
         .default(512)
-        .describe("Output px. 32/64/128 give a pixel-art look; 512 for every other style; 1024 for high-res."),
+        .describe("Output px. 32/64/128/256 give a pixel-art look; 512 for every other style; 1024 for high-res."),
       colours: z.number().int().min(4).max(12).default(8).describe("Colour count for pixel-art reduction (4–12)"),
       style: z
         .string()
@@ -736,7 +736,7 @@ export function createVoidlessServer(API_KEY) {
   server.tool(
     "upload_image",
     "Add an image the user already has to their library, so it can be animated, rotated or edited. It must " +
-      "be square at 32, 64, 128, 512 or 1024 px. Free.",
+      "be square at 32, 64, 128, 256, 512 or 1024 px. Free.",
     {
       image: z.string().describe("Base64 image (a data: prefix is stripped automatically)"),
       type: z.enum(["object", "character", "character portrait", "artwork"]).default("character"),
@@ -755,7 +755,8 @@ export function createVoidlessServer(API_KEY) {
       "saved to the library. 1 credit.",
     {
       image: z.string().describe("Base64 source image (a data: prefix is stripped automatically)"),
-      size: z.union([z.literal(32), z.literal(64), z.literal(128), z.literal(512)]).default(64),
+      size: z.union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]).default(64)
+        .describe("Pixel size. 512 and 1024 are drawn on a real 4x grid (128 / 256 art pixels)"),
       colours: z.number().int().min(4).max(12).default(8),
     },
     writeTool("Pixelate image"),
@@ -768,6 +769,56 @@ export function createVoidlessServer(API_KEY) {
         ],
         structuredContent: { title: "Pixel art", gallery: data.image ? [{ kind: "image", url: `data:image/png;base64,${data.image}`, label: "Pixelated" }] : [] },
       };
+    })
+  );
+
+  server.tool(
+    "clean_up_sprite",
+    "Make a sprite or a short animation made ANYWHERE (another AI tool, an artist, a screen recording) " +
+      "game-ready with Voidless's own clean-up: background removed with stray pieces checked (sparks and dust " +
+      "kept, smudges removed); pixel art put on a real pixel grid with one palette and stray pixels fixed. A 1-5 s " +
+      "video comes back as 16 frames: kind 'loop' cuts the cleanest loop (walk, run, idle), 'once' keeps the " +
+      "whole move (attack, jump). Saved to the user's library. Give the file as a public URL (best for videos) or " +
+      "base64. 1 free run a day (10 on Voidless+), then 1 credit an image, 2 a video. For a quick pixel-art " +
+      "version of an already clean image, pixelate_image is enough.",
+    {
+      url: z.string().optional().describe("Public http(s) link to the image or video. Use this for videos"),
+      file: z.string().optional().describe("Base64 file instead of url (a data: prefix is stripped automatically)"),
+      kind: z.enum(["image", "video"]).optional().describe("What the file is. Inferred from the url's extension when omitted"),
+      style: z.enum(["pixel", "smooth"]).default("pixel").describe("pixel = pixel art at 32-1024; smooth = clean cut-out at 512 or 1024"),
+      size: z.union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]).optional()
+        .describe("Output size. Default 64 for pixel, 512 for smooth (smooth allows only 512 or 1024)"),
+      motion: z.enum(["loop", "once"]).default("loop").describe("Video only: loop = find the cleanest loop; once = keep the whole clip"),
+    },
+    writeTool("Clean up sprite"),
+    tool(async ({ url, file, kind, style, size, motion }) => {
+      if (!url && !file) throw new Error("Give the file as a url or as base64 in file.");
+      const pixel = style !== "smooth";
+      const out = size || (pixel ? 64 : 512);
+      if (!pixel && out !== 512 && out !== 1024) throw new Error("Smooth art comes back at 512 or 1024.");
+      const guessed = /\.(mp4|webm|mov|m4v)(\?|$)/i.test(String(url || "")) ? "video"
+        : /^data:video\//i.test(String(file || "")) ? "video" : "image";
+      const body = { kind: kind || guessed, size: out, pixel, loop: motion };
+      if (url) body.url = url;
+      else body.data = String(file).replace(/^data:[^,]*,/, "");
+      const data = await apiPost("/cleanup/run", body);
+      const link = data.assetId ? `${APP_URL}/asset/${data.assetId}` : undefined;
+      const lines = [
+        `Cleaned up: ${data.kind === "video" ? `${(data.images || []).length} frames` : "1 sprite"} at ${data.size}px${data.pixel ? " pixel art" : ""}.`,
+        data.assetId ? `Asset ID: ${data.assetId} · ${link}` : null,
+        data.kind === "video" && Array.isArray(data.span) ? `Frames taken from ${data.span[0]}s to ${data.span[1]}s of the clip.` : null,
+        data.free ? `Free run (${data.freeLeft} free left today).` : null,
+        money(data),
+      ].filter(Boolean);
+      const content = [{ type: "text", text: lines.join("\n") }];
+      if (data.kind === "video") {
+        const frame = { id: 0, name: "Clean-up", type: "animation", images: data.images || [], gif: data.gif };
+        content.push(...(await frameContent([frame])));
+        return withGallery({ content }, frameItems(frame, data.assetId), "Clean-up");
+      }
+      const image = await inlineImage(data.file);
+      if (image) content.push(image);
+      return withGallery({ content }, [mediaItem(data.file, "Cleaned up", { link })], "Clean-up");
     })
   );
 

@@ -1,7 +1,7 @@
 {
   "name": "voidless-mcp",
   "mcpName": "dev.voidless/voidless",
-  "version": "1.6.8",
+  "version": "1.6.9",
   "description": "MCP server for Voidless: generate game sprites, animations, sound, music, video and 3D models",
   "license": "MIT",
   "author": "Voidless Dev Inc. <contact@voidless.dev>",
