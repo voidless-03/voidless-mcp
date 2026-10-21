@@ -73,6 +73,7 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | --- | --- |
 | `list_assets` | Your assets, newest first, filterable by type or tag |
 | `get_asset` | One asset with every frame: animations, 8-way rotations, edits and parts, with the ids and image keys the other tools take |
+| `check_generation` | The result of a long generation (animation sets, video, 3D) that was still running when its tool returned. Free |
 | `get_animation_presets` | The animation-set presets and what each pass costs |
 
 **Tagging** (free)

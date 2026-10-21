@@ -18,6 +18,8 @@ import pngjs from "pngjs";
 const { PNG } = pngjs;
 import { z } from "zod";
 import { readFileSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { Agent, setGlobalDispatcher } from "undici";
 
 // Node's fetch gives up after 5 minutes without response headers. Generation calls answer only
@@ -25,7 +27,7 @@ import { Agent, setGlobalDispatcher } from "undici";
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.6.9";
+export const VERSION = "1.6.12";
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -46,15 +48,36 @@ const GALLERY_MIME = "text/html;profile=mcp-app";
 const GALLERY_TOOLS = [
   "generate_image", "upload_image", "edit_image", "rotate_sprite", "animate_sprite", "generate_animation_set",
   "flip_left_side", "generate_video", "generate_sfx", "generate_music", "generate_3d_model", "get_asset",
-  "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite",
+  "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite", "check_generation",
 ];
 const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "utf8");
 
+// Generations that can outlast Cloudflare's 100 s cut-off (HTTP 524). An animation set takes ~4
+// minutes, so the tool used to report a failure while the job ran on, finished and charged; the
+// assistant then retried and paid twice. These calls carry a job key, wait up to WAIT_MS, and if the
+// job is still going the tool says so and check_generation fetches the result later (Strapi keeps
+// it under the key: GET /generate/job/:key).
+const LONG_PATHS = new Set([
+  "/generate/image", "/generate/image-edit", "/generate/image-rotations", "/generate/image-parts",
+  "/generate/image-animation", "/generate/multi-animation", "/generate/video", "/generate/video-extend",
+  "/generate/sfx", "/generate/music", "/generate/3d-model", "/generate/model-rig", "/generate/model-animation",
+]);
+const WAIT_MS = Number(process.env.VOIDLESS_WAIT_MS) || 80_000;
+const CUT_OFF = /\((502|504|520|522|524)\)|fetch failed|ECONNRESET|socket|terminated|other side closed/i;
+
+class PendingJob extends Error {
+  constructor(key, path) {
+    super(`Still running: ${key}`);
+    this.key = key;
+    this.path = path;
+  }
+}
+
 export function createVoidlessServer(API_KEY) {
-  async function api(method, path, body) {
+  async function api(method, path, body, headers = {}) {
     const res = await fetch(`${BASE_URL}/api${path}`, {
       method,
-      headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
+      headers: { "Content-Type": "application/json", "x-api-key": API_KEY, ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
 
@@ -74,8 +97,43 @@ export function createVoidlessServer(API_KEY) {
   }
 
   const apiGet = (path) => api("GET", path);
-  const apiPost = (path, body) => api("POST", path, body);
   const apiPut = (path, body) => api("PUT", path, body);
+
+  // check_generation re-runs the tool that started a job with its stored result standing in for the
+  // slow call, so the reply is exactly what the tool would have returned (see LONG_PATHS).
+  const replay = new AsyncLocalStorage();
+  const pending = new Map(); // job key -> { handler, args, path }
+
+  async function apiPost(path, body) {
+    const stored = replay.getStore();
+    if (stored && stored.path === path) return stored.result;
+    if (!LONG_PATHS.has(path)) return api("POST", path, body);
+    const key = `mcp-${randomUUID()}`;
+    const call = api("POST", path, body, { "X-Idempotency-Key": key }).then((v) => ({ v }), (e) => ({ e }));
+    let timer;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), WAIT_MS); });
+    try {
+      const out = await Promise.race([call, timeout]);
+      if (out === null) throw new PendingJob(key, path);
+      // The connection was cut but the job may well be running: check, do not report a failure.
+      if (out.e) throw CUT_OFF.test(String(out.e.message || out.e)) ? new PendingJob(key, path) : out.e;
+      return out.v;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function pendingResult(key) {
+    return {
+      content: [{
+        type: "text",
+        text: `Still generating — this kind of job can take 2 to 5 minutes. Job: ${key}\n` +
+          "It keeps running and its credits are already reserved. Do NOT call this tool again: that would " +
+          `make (and charge for) a second one. Call check_generation with job "${key}" in about a minute ` +
+          "to get the result.",
+      }],
+    };
+  }
 
   // Tool errors go back to the model as text it can act on, not as a protocol failure.
   function tool(handler) {
@@ -83,6 +141,11 @@ export function createVoidlessServer(API_KEY) {
       try {
         return await handler(args);
       } catch (err) {
+        if (err instanceof PendingJob) {
+          pending.set(err.key, { handler, args, path: err.path });
+          if (pending.size > 500) pending.delete(pending.keys().next().value);
+          return pendingResult(err.key);
+        }
         return { isError: true, content: [{ type: "text", text: String(err.message || err) }] };
       }
     };
@@ -277,9 +340,13 @@ export function createVoidlessServer(API_KEY) {
     return item ? [item] : [];
   }
   const MAX_GALLERY = 48;
+  // Clients that read structuredContent hand the MODEL that object instead of the text content
+  // (Claude Code does), so it carries the same text as `summary`: without it the model saw only the
+  // gallery and told users "the tool didn't report its cost" and that it had one frame to look at.
+  const textOf = (result) => (result.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
   const withGallery = (result, items, title) => ({
     ...result,
-    structuredContent: { title, gallery: items.filter(Boolean).slice(0, MAX_GALLERY) },
+    structuredContent: { title, summary: textOf(result), gallery: items.filter(Boolean).slice(0, MAX_GALLERY) },
   });
 
   // Read by clients as the server's standing instructions (MCP `instructions`).
@@ -471,6 +538,41 @@ export function createVoidlessServer(API_KEY) {
         uri,
       ];
       return { content: [{ type: "text", text: lines.join("\n") }] };
+    })
+  );
+
+  server.tool(
+    "check_generation",
+    "Get the result of a generation that was still running when its tool returned (the tool said " +
+      "'Still generating' and gave a job). Call it about a minute later; if it is still running, wait and " +
+      "call again. Never re-run the original tool instead: that makes and charges a second one. Free.",
+    { job: z.string().min(8).max(100).describe("The job from the 'Still generating' message") },
+    readTool("Check generation"),
+    tool(async ({ job }) => {
+      let st;
+      try {
+        st = await apiGet(`/generate/job/${encodeURIComponent(job)}`);
+      } catch (err) {
+        if (/\(404\)/.test(String(err.message))) {
+          return { content: [{ type: "text", text: `No job ${job} on record (jobs are kept for 2 hours). ` +
+            "The result may already be in the library: list_assets or get_asset shows it." }] };
+        }
+        throw err;
+      }
+      if (st.status === "running") {
+        const where = st.step ? `${st.step}, about ${Math.round((Number(st.fraction) || 0) * 100)}% — ` : "";
+        return { content: [{ type: "text", text: `Still running: ${where}${st.seconds}s so far. Check again in about a minute.` }] };
+      }
+      if (st.status === "failed") {
+        const msg = st.result?.error?.message || st.result?.message || `HTTP ${st.httpStatus}`;
+        return { isError: true, content: [{ type: "text", text: `The generation failed: ${msg}` }] };
+      }
+      const p = pending.get(job);
+      if (!p) {
+        // This connector restarted since the job began: the raw result is all there is.
+        return { content: [{ type: "text", text: `Done. Result:\n${JSON.stringify(st.result).slice(0, 4000)}` }] };
+      }
+      return replay.run({ path: p.path, result: st.result }, () => p.handler(p.args));
     })
   );
 
@@ -721,15 +823,14 @@ export function createVoidlessServer(API_KEY) {
       // The ids returned here are off by (parts - 1): the server numbers from the last appended
       // frame. Point at get_asset instead of printing ids that would misdirect a follow-up call.
       const names = (data.frames || []).map((f) => f.name).filter(Boolean);
-      return {
+      return withGallery({
         content: [
           {
             type: "text",
             text: `Extracted ${names.length} parts from asset ${args.id}: ${names.join(", ")}.\n${money(data)}\nUse get_asset ${args.id} for their frame ids and image keys.`,
           },
         ],
-        structuredContent: { title: "Parts", gallery: (data.frames || []).flatMap((f) => frameItems(f, args.id)).slice(0, MAX_GALLERY) },
-      };
+      }, (data.frames || []).flatMap((f) => frameItems(f, args.id)), "Parts");
     })
   );
 
@@ -762,13 +863,12 @@ export function createVoidlessServer(API_KEY) {
     writeTool("Pixelate image"),
     tool(async ({ image, ...rest }) => {
       const data = await apiPost("/pixelate/image", { image: String(image).replace(/^data:[^,]*,/, ""), ...rest });
-      return {
+      return withGallery({
         content: [
           { type: "text", text: money(data) || "Pixelated." },
           { type: "image", data: data.image, mimeType: "image/png" },
         ],
-        structuredContent: { title: "Pixel art", gallery: data.image ? [{ kind: "image", url: `data:image/png;base64,${data.image}`, label: "Pixelated" }] : [] },
-      };
+      }, data.image ? [{ kind: "image", url: `data:image/png;base64,${data.image}`, label: "Pixelated" }] : [], "Pixel art");
     })
   );
 
