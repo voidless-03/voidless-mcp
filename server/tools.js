@@ -27,7 +27,7 @@ import { Agent, setGlobalDispatcher } from "undici";
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.6.12";
+export const VERSION = "1.6.14";
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -71,6 +71,25 @@ class PendingJob extends Error {
     this.key = key;
     this.path = path;
   }
+}
+
+// A finished job whose full result the server no longer has (kept as a summary on its log): what it
+// made, and where to look, instead of a result the tool could format.
+class RestoredJob extends Error {
+  constructor(result) {
+    super(result?.message || "Finished.");
+    this.result = result;
+  }
+}
+
+function restoredText(result) {
+  const ids = Array.isArray(result?.assetIds) ? result.assetIds : [];
+  return [
+    `Done. ${result?.message || "The generation finished."}`,
+    ids.length ? `Asset${ids.length === 1 ? "" : "s"}: ${ids.join(", ")}` : null,
+    Array.isArray(result?.frameIds) && result.frameIds.length ? `New frame ids: ${result.frameIds.join(", ")}` : null,
+    "It has already been made and charged: do not run it again.",
+  ].filter(Boolean).join("\n");
 }
 
 export function createVoidlessServer(API_KEY) {
@@ -117,6 +136,10 @@ export function createVoidlessServer(API_KEY) {
       if (out === null) throw new PendingJob(key, path);
       // The connection was cut but the job may well be running: check, do not report a failure.
       if (out.e) throw CUT_OFF.test(String(out.e.message || out.e)) ? new PendingJob(key, path) : out.e;
+      // The server already had this key (a resend): it answers with that job's state instead of
+      // running it again -- still going (202), or done but only a summary kept.
+      if (out.v && out.v.job === key && out.v.status === "running") throw new PendingJob(key, path);
+      if (out.v && out.v.restored) throw new RestoredJob(out.v);
       return out.v;
     } finally {
       clearTimeout(timer);
@@ -146,6 +169,7 @@ export function createVoidlessServer(API_KEY) {
           if (pending.size > 500) pending.delete(pending.keys().next().value);
           return pendingResult(err.key);
         }
+        if (err instanceof RestoredJob) return { content: [{ type: "text", text: restoredText(err.result) }] };
         return { isError: true, content: [{ type: "text", text: String(err.message || err) }] };
       }
     };
@@ -270,11 +294,25 @@ export function createVoidlessServer(API_KEY) {
   }
 
   // Multi-animation responses: { results: [{ assetId, frames, skipped? }], quality, cost, … }.
+  // "2 sprites × 7 clips": one line for the shape of the set.
+  function setSummary(data) {
+    const made = (data.results || []).filter((r) => !r.skipped && !r.mirrored);
+    if (!made.length) return null;
+    const perAsset = new Map();
+    for (const r of made) perAsset.set(r.assetId, (perAsset.get(r.assetId) || 0) + (r.frames || []).length);
+    const counts = [...perAsset.values()];
+    const total = counts.reduce((a, n) => a + n, 0);
+    const sprites = perAsset.size;
+    return counts.every((n) => n === counts[0])
+      ? `${sprites} sprite${sprites === 1 ? "" : "s"} × ${counts[0]} clip${counts[0] === 1 ? "" : "s"}`
+      : `${total} clips on ${sprites} sprite${sprites === 1 ? "" : "s"}`;
+  }
+
   async function resultsContent(data, label) {
     const content = [
       {
         type: "text",
-        text: [label, data.quality ? `Quality: ${data.quality}` : null, money(data)].filter(Boolean).join("\n"),
+        text: [label, setSummary(data), data.quality ? `Quality: ${data.quality}` : null, money(data)].filter(Boolean).join("\n"),
       },
     ];
     let inlined = 0;
@@ -554,8 +592,11 @@ export function createVoidlessServer(API_KEY) {
         st = await apiGet(`/generate/job/${encodeURIComponent(job)}`);
       } catch (err) {
         if (/\(404\)/.test(String(err.message))) {
-          return { content: [{ type: "text", text: `No job ${job} on record (jobs are kept for 2 hours). ` +
-            "The result may already be in the library: list_assets or get_asset shows it." }] };
+          // Not a failure: the server has no record of the key, which says nothing about the job.
+          return { content: [{ type: "text", text: `The server has no record of job ${job}. That does NOT mean it ` +
+            "failed: it may well have finished and been charged. Before running anything again, look for the " +
+            "result with list_assets (newest first) or get_asset on the asset it was for, and ask the user " +
+            "before re-running the tool." }] };
         }
         throw err;
       }
@@ -567,6 +608,8 @@ export function createVoidlessServer(API_KEY) {
         const msg = st.result?.error?.message || st.result?.message || `HTTP ${st.httpStatus}`;
         return { isError: true, content: [{ type: "text", text: `The generation failed: ${msg}` }] };
       }
+      // Finished before a server restart, with only a summary kept: point at the asset.
+      if (st.result && st.result.restored) return { content: [{ type: "text", text: restoredText(st.result) }] };
       const p = pending.get(job);
       if (!p) {
         // This connector restarted since the job began: the raw result is all there is.
@@ -613,18 +656,19 @@ export function createVoidlessServer(API_KEY) {
   server.tool(
     "get_animation_presets",
     "List the animation-set presets (platformer-character, topdown-walk/run/dash/attack/idle) with the " +
-      "actions each one makes, and the quality tiers with their credit cost per pass. Free.",
+      "actions each one makes, and the credit cost per clip. Free.",
     {},
     readTool("Get animation presets"),
     tool(async () => {
       const data = await apiGet("/generate/multi-animation/presets");
       const presets = (data.presets || []).map((p) => `- ${p.key} (${p.label}): ${p.actions.join(", ")}`);
-      const qualities = (data.qualities || []).map((q) => `- ${q.key}: ${q.resolution}, ${q.credits} credits per pass`);
+      const perClip = Number(data.pricePerClip) > 0 ? Number(data.pricePerClip) : 15;
       return {
         content: [
           {
             type: "text",
-            text: `Presets:\n${presets.join("\n")}\n\nQuality (picked automatically from the sprite size):\n${qualities.join("\n")}\n\nUp to ${data.maxImages} images per run.`,
+            text: `Presets:\n${presets.join("\n")}\n\n${perClip} credits per clip (mirrored left-side clips are free). ` +
+              `Up to ${data.maxImages} images per run.`,
           },
         ],
       };
@@ -759,7 +803,7 @@ export function createVoidlessServer(API_KEY) {
       aspect: z
         .enum(["1:1", "16:9"])
         .default("1:1")
-        .describe("type 'artwork' only: '16:9' for a backdrop, scene or game background (1344x756 at 1024, 672x378 at 512). Everything that is not artwork is always 1:1"),
+        .describe("type 'artwork' at size 512 or 1024 only: '16:9' for a backdrop, scene or game background (1344x756 at 1024, 672x378 at 512; pixel-art styles come out on a 4 px grid, 672x376 at 512). Smaller sizes, Retro Diffusion and everything that is not artwork are always 1:1"),
       uiMode: z
         .enum(["graphic", "title", "text"])
         .default("graphic")
@@ -929,7 +973,8 @@ export function createVoidlessServer(API_KEY) {
   server.tool(
     "animate_sprite",
     "Animate one sprite into a single 16-frame clip from a description of the motion. For several clips " +
-      "(walk + run + attack, or every direction) use generate_animation_set instead: it is one job. 15 credits.",
+      "(walk + run + attack, or every direction) use generate_animation_set instead: one job, " +
+      "15 credits per clip. 15 credits.",
     {
       id: assetId,
       prompt: z.string().describe("The motion, e.g. 'walk cycle', 'swings sword overhead'"),
@@ -950,22 +995,24 @@ export function createVoidlessServer(API_KEY) {
 
   server.tool(
     "generate_animation_set",
-    "Generate several animations in one job. Two ways to use it:\n" +
-      "1. A PRESET on one sprite: platformer-character (idle, run, jump, attack-1, death, hurt) or a top-down " +
-      "set (topdown-walk/run/dash/attack: 8 directions; topdown-idle: 4). Each item gets the preset's actions.\n" +
+    "Generate several animations in one job, one clip per animation, all run in parallel. Ways to use it:\n" +
+      "1. A PRESET on one or more sprites: platformer-character (idle, walk, run, jump, attack-1, death, hurt) or " +
+      "a top-down set (topdown-walk/run/dash/attack: 8 directions; topdown-idle: 4). Every sprite gets every " +
+      "action of the preset.\n" +
       "2. A PRESET across an 8-way rotation set: one item per facing, {assetId, frameIndex:<rotation frame id>, " +
       "imageIndex:i} where i is the facing's position in the frame's facings list, and every facing gets its own " +
       "directional clip (walk-left from the left-facing image, …). If the facings list has no 'down' (the sprite " +
       "was drawn facing the camera), add {assetId, base:true} as 'down'. If it already has 'down' (a side-view " +
       "sprite), use only the rotation's own images: the base is the side view, not the front. For topdown-idle " +
-      "pick only the 4 cardinals (down, right, up, left).\n" +
-      "Without a preset, list the actions in the prompt for up to 6 custom clips, one clip each: " +
-      "'name: description' separated by semicolons names each clip (e.g. 'attack-2: an overhead slash; block: raise " +
-      "the sword to guard'); for one image a plain 'idle, run, jump' also works. Every image gets every action. " +
-      "Cost: 100 credits per pass (200 for 1024px sprites, which run in 4K); a pass holds up to 6 clips. On an " +
-      "8-way rotation set the left, up-left and down-left clips are mirrored from the right-side ones (the " +
-      "rotation's left side is a mirror already), so an 8-way set is ONE pass; set flipFacings false to animate " +
-      "all eight (2 passes). Clips are added to their source asset as frames named after the action.",
+      "pick only the 4 cardinals (down, right, up, left). The left, up-left and down-left clips are mirrored " +
+      "from their right-side twins in the same rotation set, for free; set flipFacings false to animate them too.\n" +
+      "3. No preset, a typed action: one clip per image. A list of actions makes one clip per action (up to 6): " +
+      "'name: description' separated by semicolons names each clip (e.g. 'attack-2: an overhead slash; block: " +
+      "raise the sword to guard'); for one image a plain 'idle, run, jump' also works. Several actions on several " +
+      "images: every image gets every action.\n" +
+      "Cost: 15 credits per clip (mirrored clips are free; clips that fail are refunded). Clips that come back to " +
+      "their start (idle, walk, run, attack, jump, hurt, dash) end on their own first frame, so they loop; one-off " +
+      "clips such as a death do not. Clips are added to their source asset as frames named after the action.",
     {
       items: z.array(pick).min(1).max(12).describe("Images to animate, in order"),
       preset: z
@@ -973,8 +1020,8 @@ export function createVoidlessServer(API_KEY) {
         .optional()
         .describe("Named set of actions (see get_animation_presets)"),
       prompt: z.string().default("").describe("Without a preset: the actions to make, as 'name: description' separated by semicolons. With one: optional extra direction for every clip"),
-      holdFacing: z.boolean().default(false).describe("End every clip on the frame it started from, so directional loops do not drift"),
-      flipFacings: z.boolean().default(true).describe("On an 8-way rotation set, mirror the left-side clips from the right-side ones instead of animating them (half the price). One-sided details swap sides, as on the rotation images"),
+      holdFacing: z.boolean().default(false).describe("End every clip on the frame it started from, even one-off clips such as a death (by default loops end on their start and one-offs don't)"),
+      flipFacings: z.boolean().default(true).describe("On an 8-way rotation set, mirror the left-side clips from the right-side ones instead of animating them (mirrored clips are free). One-sided details swap sides, as on the rotation images"),
       autoFlip: z.boolean().default(false).describe("After the run, mirror every right-side clip on the asset that has no left twin (animate only the right-facing turns, get all eight). Free"),
     },
     writeTool("Generate animation set"),
@@ -1071,12 +1118,17 @@ export function createVoidlessServer(API_KEY) {
 
   server.tool(
     "generate_3d_model",
-    "Generate a 3D model (GLB) from a prompt. 15 credits (lq) or 60 (hq).",
+    "Generate a 3D model (GLB) from a prompt. 45 credits (game-ready) or 15 (lq draft).",
     {
       prompt: z.string().describe("The model to make"),
       type: z.enum(["object", "character"]).default("object").describe("'character' makes a T-posed figure ready for rigging"),
-      style: z.string().default("cartoon style").describe("e.g. 'cartoon style', 'low-poly', 'realistic'"),
-      mode: z.enum(["lq", "hq"]).default("hq").describe("lq = fast draft (15 credits), hq = detailed (60 credits)"),
+      style: z.string().default("low-poly").describe(
+        "'low-poly' (default: faceted triangles, flat colours), 'blocky' (voxel art, built from cubes), 'claymation', 'origami', " +
+          "'hand-painted' (stylized fantasy) or 'toy' (glossy vinyl figure)"
+      ),
+      mode: z.enum(["game", "lq", "hq"]).default("game").describe(
+        "game = game-ready, a light clean mesh of about 19k triangles (45 credits); lq = draft (15 credits). hq is an old name for game"
+      ),
       bodyType: z.enum(["humanoid", "quadruped"]).default("humanoid").describe("Characters only"),
       seed: z.number().int().min(0).default(0),
     },

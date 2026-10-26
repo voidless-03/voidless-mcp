@@ -74,7 +74,7 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | `list_assets` | Your assets, newest first, filterable by type or tag |
 | `get_asset` | One asset with every frame: animations, 8-way rotations, edits and parts, with the ids and image keys the other tools take |
 | `check_generation` | The result of a long generation (animation sets, video, 3D) that was still running when its tool returned. Free |
-| `get_animation_presets` | The animation-set presets and what each pass costs |
+| `get_animation_presets` | The animation-set presets and what each clip costs |
 
 **Tagging** (free)
 
@@ -100,7 +100,7 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | Tool | What it does |
 | --- | --- |
 | `animate_sprite` | One 16-frame clip from a description of the motion |
-| `generate_animation_set` | Several clips in one job: a preset (platformer, top-down walk/run/dash/attack/idle) on one sprite, or one directional clip per facing of an 8-way set; the left side is mirrored from the right (`autoFlip` to mirror any right-only clips after the run) |
+| `generate_animation_set` | Several clips in one job, 15 credits each: a preset (platformer, top-down walk/run/dash/attack/idle) on one or more sprites, one directional clip per facing of an 8-way set (the left side mirrored from the right for free; `autoFlip` mirrors any right-only clips after the run), or your own list of actions. Loops end on their first frame |
 | `get_image_data` | An image, or an animation as one sprite strip, as a small data URI to paste into HTML (for sandboxes such as Claude's HTML artifacts that cannot load outside images), with a CSS snippet to play it |
 | `flip_left_side` | Mirror the right-side animations into the left side (walk-right -> walk-left), free |
 
