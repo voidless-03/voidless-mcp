@@ -27,7 +27,7 @@ import { Agent, setGlobalDispatcher } from "undici";
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.6.14";
+export const VERSION = "1.7.0";
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -46,9 +46,10 @@ const MAX_INLINE_IMAGES = 8;
 const GALLERY_URI = "ui://voidless/gallery.html";
 const GALLERY_MIME = "text/html;profile=mcp-app";
 const GALLERY_TOOLS = [
-  "generate_image", "upload_image", "edit_image", "rotate_sprite", "animate_sprite", "generate_animation_set",
+  "generate_image", "upload_image", "edit_image", "make_normal_map", "make_glow_map", "rotate_sprite", "animate_sprite", "generate_animation_set",
   "flip_left_side", "generate_video", "generate_sfx", "generate_music", "generate_3d_model", "get_asset",
   "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite", "check_generation",
+  "render_3d_sprites",
 ];
 const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "utf8");
 
@@ -58,9 +59,10 @@ const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "u
 // job is still going the tool says so and check_generation fetches the result later (Strapi keeps
 // it under the key: GET /generate/job/:key).
 const LONG_PATHS = new Set([
-  "/generate/image", "/generate/image-edit", "/generate/image-rotations", "/generate/image-parts",
+  "/generate/image", "/generate/image-edit", "/generate/bbox-edit", "/generate/image-rotations", "/generate/image-parts",
   "/generate/image-animation", "/generate/multi-animation", "/generate/video", "/generate/video-extend",
   "/generate/sfx", "/generate/music", "/generate/3d-model", "/generate/model-rig", "/generate/model-animation",
+  "/generate/model-sprites",
 ]);
 const WAIT_MS = Number(process.env.VOIDLESS_WAIT_MS) || 80_000;
 const CUT_OFF = /\((502|504|520|522|524)\)|fetch failed|ECONNRESET|socket|terminated|other side closed/i;
@@ -92,11 +94,14 @@ function restoredText(result) {
   ].filter(Boolean).join("\n");
 }
 
-export function createVoidlessServer(API_KEY) {
+// `transport` is "stdio" (index.js) or "hosted" (http.js). Every API call says it comes from the MCP
+// server, so Voidless can tell these generations from the web app's and from direct API use.
+export function createVoidlessServer(API_KEY, transport = "stdio") {
+  const CLIENT = `mcp/${VERSION} (${transport})`;
   async function api(method, path, body, headers = {}) {
     const res = await fetch(`${BASE_URL}/api${path}`, {
       method,
-      headers: { "Content-Type": "application/json", "x-api-key": API_KEY, ...headers },
+      headers: { "Content-Type": "application/json", "x-api-key": API_KEY, "X-Voidless-Client": CLIENT, ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
 
@@ -748,7 +753,7 @@ export function createVoidlessServer(API_KEY) {
     "Generate a game sprite/asset image. Infer every field from the request: art STYLE, colour PALETTE, " +
       "asset TYPE, output SIZE and PERSPECTIVE; for characters also facing/pose/bodyType. Use the default model " +
       "(flux2-klein, 1 credit) unless the user names another. Costs by model: flux2-klein 1, flux-juggernaut 1, " +
-      "seedream-5-flash 2, gpt-image-2.5 5, retro-diffusion 10, nano-banana-2 15 credits (a reference image makes it " +
+      "seedream-5-flash 10, gpt-image-2.5 5, retro-diffusion 10, nano-banana-2 15 credits (a reference image makes it " +
       "2 and uses flux2-klein). Call it once per request and " +
       "show the result; ask the user before generating again (each call spends credits).",
     {
@@ -842,6 +847,65 @@ export function createVoidlessServer(API_KEY) {
   );
 
   server.tool(
+    "make_normal_map",
+    "Make a normal map for an image asset, for 2D lights in a game engine: which way each pixel faces, so a " +
+      "moving light shades it. The shape comes from a depth model, the drawn detail from the picture. PNG at the " +
+      "picture's own size, OpenGL style (green = up: Godot and Unity read it as is; flip green for Unreal). " +
+      "Pass frameId (from get_asset) for an edit, or an animation (one map per frame); leave it out for the " +
+      "image itself. Free.",
+    {
+      id: assetId,
+      frameId: z
+        .number()
+        .int()
+        .optional()
+        .describe("Optional: the frame (an edit or an animation, from get_asset) to make it for. Empty = the image itself."),
+    },
+    writeTool("Make normal map"),
+    tool(async ({ id, frameId: fid }) => {
+      const data = await apiPost("/generate/normal-map", { id, ...(fid === undefined ? {} : { frameId: fid }) });
+      const keys = data.maps?.normals || (data.maps?.normal ? [data.maps.normal] : []);
+      const content = [
+        {
+          type: "text",
+          text:
+            `Normal map${keys.length > 1 ? `s (${keys.length}, one per frame)` : ""} saved on asset ${id} ` +
+            `(${APP_URL}/asset/${id}):\n` + keys.map((k) => `${CDN_URL}/${k}`).join("\n"),
+        },
+      ];
+      const image = keys.length ? await inlineImage(keys[0]) : null;
+      if (image) content.push(image);
+      return { content, structuredContent: { summary: content[0].text } };
+    })
+  );
+
+  server.tool(
+    "make_glow_map",
+    "Make a glow map from an edit that switched lights on (or made a night version with lights glowing): the " +
+      "light the edit added over the picture it came from, on transparency, for an additive or emissive layer in " +
+      "a game. Same size as the picture. Pass the edit's frameId (from get_asset). Free.",
+    {
+      id: assetId,
+      frameId: z.number().int().describe("The edit (a frame from get_asset) whose light to keep"),
+    },
+    writeTool("Make glow map"),
+    tool(async ({ id, frameId: fid }) => {
+      const data = await apiPost("/generate/glow-map", { id, frameId: fid });
+      const keys = data.maps?.glows || (data.maps?.glow ? [data.maps.glow] : []);
+      const content = [
+        {
+          type: "text",
+          text: `Glow map${keys.length > 1 ? `s (${keys.length})` : ""} saved on asset ${id} (${APP_URL}/asset/${id}):\n` +
+            keys.map((k) => `${CDN_URL}/${k}`).join("\n"),
+        },
+      ];
+      const image = keys.length ? await inlineImage(keys[0]) : null;
+      if (image) content.push(image);
+      return { content, structuredContent: { summary: content[0].text } };
+    })
+  );
+
+  server.tool(
     "rotate_sprite",
     "Turn a sprite into an 8-way set (front, back, sides and diagonals) in one pass. The result is a " +
       "'rotations - 8-way' frame whose facings line up with its images; pass those to generate_animation_set " +
@@ -854,7 +918,7 @@ export function createVoidlessServer(API_KEY) {
   server.tool(
     "extract_parts",
     "Split a character sprite into separate body parts (head, torso, arms, legs…) as 'layer' frames, for " +
-      "rigging or cut-out animation. 5 credits. Call get_asset afterwards for the parts' frame ids.",
+      "rigging or cut-out animation. 10 credits. Call get_asset afterwards for the parts' frame ids.",
     {
       id: assetId,
       prompt: z.string().default("").describe("Optional: which parts to cut out. Empty = the standard rig parts"),
@@ -1141,11 +1205,10 @@ export function createVoidlessServer(API_KEY) {
 
   server.tool(
     "rig_3d_model",
-    "Add a skeleton to a humanoid 3D model so it can be animated (non-humanoids are refused before any " +
-      "charge). Run before animate_3d_model. 140 credits.",
+    "Add a skeleton to a 3D model so it can be animated: a humanoid, a four-legged animal, or a prop's " +
+      "moving parts (a chest lid, a door, a tree's trunk). Run before animate_3d_model. 30 credits.",
     {
       id: z.number().int().describe("3D model asset ID"),
-      height_meters: z.number().min(0.2).max(10).default(1.7).describe("Character height in metres"),
     },
     writeTool("Rig 3D model"),
     tool(async (args) => {
@@ -1156,11 +1219,18 @@ export function createVoidlessServer(API_KEY) {
 
   server.tool(
     "animate_3d_model",
-    "Animate a rigged 3D model from a description of the motion. 30 credits.",
+    "Animate a rigged 3D model. Either a ready-made move (free; characters: idle, walk, run, jump, attack, " +
+      "punch, kick, wave, hurt, death, cast, dance; four-legged animals: idle, walk, run, jump, attack, sit, hurt, " +
+      "death), a move copied from another of the user's rigged models (free: from_id + from_animation), or a " +
+      "description of any motion ('wag its tail', 'open the lid', 20 credits). Returns the clip, a GLB of the " +
+      "skeleton's motion that plays on the rigged model.",
     {
       id: z.number().int().describe("Rigged 3D model asset ID"),
-      prompt: z.string().describe("The motion, e.g. 'walk cycle', 'idle breathing'"),
-      duration: z.number().min(1).max(10).default(3).describe("Seconds"),
+      preset: z.string().optional().describe("Ready-made move id, e.g. 'walk' (free)"),
+      from_id: z.number().int().optional().describe("Copy a move from this other rigged model (free)"),
+      from_animation: z.number().int().optional().describe("The animation id on from_id to copy"),
+      prompt: z.string().optional().describe("Or describe the motion, e.g. 'a spinning kick' (20 credits)"),
+      duration: z.number().min(1).max(10).optional().describe("Seconds, for a described motion (default: its natural length)"),
     },
     writeTool("Animate 3D model"),
     tool(async (args) => {
@@ -1169,6 +1239,50 @@ export function createVoidlessServer(API_KEY) {
       return {
         content: [{ type: "text", text: `Animation "${anim.name || args.prompt}" on model ${args.id}: ${cdnUrl(anim.file)}\n${money(data)}` }],
       };
+    })
+  );
+
+  server.tool(
+    "render_3d_sprites",
+    "Render a 3D model as 2D game sprites: one of its moves (from animate_3d_model) or the model standing, " +
+      "seen from 8 directions, 4, the two sides of a platformer, 4 isometric diagonals, or the front. 16 frames " +
+      "by default, at 32-512 px (pixel art up to 128, from the same pass as generated sprites; smooth above). Saved as an " +
+      "animated sprite asset linked to the model, one animation per direction, ready to export as a sheet or " +
+      "edit. Every render of the same model goes onto that one asset. Free.",
+    {
+      id: z.number().int().describe("3D model asset ID"),
+      animation: z
+        .string()
+        .optional()
+        .describe("The move to render: its name ('walk'), preset or animation id. Empty = the model standing"),
+      directions: z
+        .enum(["eight", "four", "platformer", "isometric", "front"])
+        .default("eight")
+        .describe("Which views: 8 around, 4 (down/right/up/left), platformer (right, left, side-on), isometric diagonals, or the front"),
+      size: z
+        .union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512)])
+        .default(128)
+        .describe("Sprite size in pixels: 32-128 come out as pixel art, 256 and 512 as smooth renders"),
+      frames: z.number().int().min(2).max(32).default(16).describe("Frames per direction (default 16)"),
+    },
+    writeTool("Render 3D sprites"),
+    tool(async (args) => {
+      const data = await apiPost("/generate/model-sprites", args);
+      const asset = await apiGet(`/assets/${data.assetId}`).catch(() => null);
+      const name = String(data.animation?.name || "still").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+      const made = ((asset?.meta_data?.frames) || [])
+        .filter((f) => f && f.type === "animation" && String(f.name || "").startsWith(`${name}-`))
+        .slice(-(data.directions || []).length || undefined);
+      const head = [
+        `${data.animation ? `"${data.animation.name}"` : "The model standing"} rendered from 3D: ` +
+          `${(data.directions || []).length} direction${(data.directions || []).length === 1 ? "" : "s"} ` +
+          `(${(data.directions || []).join(", ")}), ${data.frameCount} frame${data.frameCount === 1 ? "" : "s"} each at ${data.size} px, ${data.fps} fps.`,
+        `${data.added ? "Added to" : "Saved as"} sprite asset ${data.assetId} (${APP_URL}/asset/${data.assetId}), linked to model ${args.id}.`,
+        money(data),
+      ].filter(Boolean).join("\n");
+      const content = [{ type: "text", text: head }];
+      if (made.length) content.push(...(await frameContent(made)));
+      return withGallery({ content }, made.flatMap((f) => frameItems(f, data.assetId)), "3D sprites");
     })
   );
 

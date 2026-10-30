@@ -2,14 +2,14 @@
 
 Generate game assets from any MCP client (claude.ai, ChatGPT, Claude Desktop, Claude Code, Cursor, VS Code, Windsurf and others): sprites, animations, tilesets, sound effects, music, video and 3D models, saved straight to your [Voidless](https://voidless.dev) library and shown right in the chat.
 
-Two ways to connect: the **hosted connector** (paste a URL, sign in, nothing to install) or this **npm package** (runs locally with an API key). Setup guide: [voidless.dev/mcp](https://voidless.dev/mcp).
+Two ways to connect: the **hosted connector** (paste a URL, sign in, nothing to install; recommended) or this **npm package** (runs locally with an API key). Setup guide: [voidless.dev/mcp](https://voidless.dev/mcp).
 
 ## Requirements
 
-- A Voidless account on **Voidless+**
-- For the npm package: Node.js 18 or newer and an API key (starts with `void_`), created at [voidless.dev/account](https://voidless.dev/account)
+- For the hosted connector: a free Voidless account is enough
+- For the npm package: Node.js 18 or newer and your own API key (starts with `void_`), created at [voidless.dev/account](https://voidless.dev/account). API keys are a **Voidless+** perk
 
-Every generation spends credits from your Voidless account. Tool descriptions list the cost tiers where they differ.
+Every generation spends credits from your Voidless account, at the same prices as the website, and your plan's rules apply as they do there. Tool descriptions list the cost tiers where they differ. The free game-dev tools (below) cost no credits.
 
 ## Setup
 
@@ -23,7 +23,8 @@ https://mcp.voidless.dev/mcp
 
 - **Claude** (claude.ai and the Claude apps): **Settings → Connectors → Add custom connector**, name it Voidless and paste the URL.
 - **ChatGPT** (web, paid plans): **Settings → Apps & Connectors → Advanced settings**, turn on **Developer mode**, then **Create**, paste the URL and choose **OAuth**.
-- Any other MCP client that takes a remote server URL works the same way.
+- **Claude Code**: `claude mcp add --transport http voidless https://mcp.voidless.dev/mcp`, then `/mcp` to sign in.
+- **Cursor** and any other MCP client that takes a remote server URL work the same way.
 
 You'll be asked to sign in to Voidless and click **Allow**; no API key to copy. Results show inline in
 hosts that support MCP Apps: images, every facing of a rotation, animations playing, and audio and video
@@ -31,7 +32,7 @@ players. To disconnect, revoke the "… connector" key under API keys on [voidle
 
 ### Local server (npx)
 
-For clients that run a local server, or to work with image files on your own disk.
+For clients that run a local server, or to work with image files on your own disk. Needs your own API key (Voidless+).
 
 Claude Desktop / Cursor / any client with a JSON config:
 
@@ -89,6 +90,8 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | --- | --- |
 | `generate_image` | Sprite, character, portrait, prop, tileset, UI piece or artwork in a chosen model, style, palette, size and perspective; artwork can be 16:9 for backdrops |
 | `edit_image` | Change an image with an instruction; the edit is added as a new frame |
+| `make_normal_map` | A normal map for an image, an edit or every frame of an animation, for 2D lights in a game engine; free |
+| `make_glow_map` | The light an edit added (lit windows, a night version's lamps) on its own, for an additive glow layer; free |
 | `rotate_sprite` | An 8-way set (front, back, sides, diagonals) in one pass |
 | `extract_parts` | Split a character into body parts for rigging |
 | `upload_image` | Add an image you already have to your library |
@@ -111,6 +114,20 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 | `generate_sfx` / `generate_music` | Sound effect, or a music track with length, tempo and key |
 | `generate_video` / `extend_video` | Short clip from a prompt and reference images, or continue one |
 | `generate_3d_model` / `rig_3d_model` / `animate_3d_model` | 3D model, rig it, animate it |
+| `render_3d_sprites` | A 3D model's move (or the model standing) as 2D sprites: 8, 4, platformer, isometric or front views, 16 frames, 32-512 px; free |
+
+**Free game-dev tools** (no credits)
+
+The same tools as [voidless.dev/tools](https://voidless.dev/tools), for any image, not just your library. Inputs are image URLs (a `cdn.voidless.dev` link from `get_asset` works) or base64/data URIs, PNG or GIF, up to 2048x2048, 256 frames and 32 MB per call. Results come back in the chat: images as PNG/GIF, the `.tres` and atlas `.json` as text. They run on Voidless's server: the hosted connector serves them, and the npm package forwards them there with your key (so they need a connection).
+
+| Tool | What it does |
+| --- | --- |
+| `slice_sprite_sheet` | Cut a sheet into frames by columns/rows or cell size, or auto-detect the grid; optional trim, empty cells skipped |
+| `pack_sprite_sheet` | Pack frames into one sheet plus a frames-hash atlas JSON (Phaser, PixiJS); padding, grid columns, power-of-two |
+| `export_godot_spriteframes` | A Godot 4 SpriteFrames `.tres` and the sheet PNG it references, from frames or a sheet, with named animations (fps, loop) |
+| `make_gif` | Frames or a sheet to an animated GIF: fps, loop, nearest-neighbour scale, transparency kept |
+| `palette_swap` | Swap colours (exact from→to pairs, or nearest), or quantize to a preset/custom palette with dithering; lists an image's colours |
+| `add_outline` | Outline a transparent sprite: colour, thickness, outside or inside, 4- or 8-connected |
 
 Generation tools create new content in your library; none deletes or overwrites existing assets. Each tool's description lists its credit cost.
 
@@ -121,10 +138,11 @@ Generation tools create new content in your library; none deletes or overwrites 
 - "Generate a top-down grass and dirt tileset in a gameboy palette."
 - "Give me a coin pickup sound effect and a short chiptune loop for the title screen."
 - "Create a low-poly treasure chest 3D model, rig it and animate it opening."
+- "Slice this sheet into frames, make a 2x GIF of it, and give me a Godot SpriteFrames with idle (frames 0-3) and walk (4-9)."
 
 ## Privacy Policy
 
-This server sends your prompts, any images you pass in, and your API key to the Voidless API (api.voidless.dev) to run generations; results are stored in your Voidless account. It collects nothing else and keeps no local data. See the [Voidless Privacy Policy](https://voidless.dev/privacy-policy) for how Voidless collects, uses, stores, shares and retains data, and the [Terms of Service](https://voidless.dev/terms-of-service).
+This server sends your prompts, any images you pass in, and your API key to the Voidless API (api.voidless.dev) to run generations; results are stored in your Voidless account. The free tools send their inputs to mcp.voidless.dev, which processes them in memory and stores nothing; each call is logged against your account (tool, time taken, success, result size) for usage statistics. It collects nothing else and keeps no local data. See the [Voidless Privacy Policy](https://voidless.dev/privacy-policy) for how Voidless collects, uses, stores, shares and retains data, and the [Terms of Service](https://voidless.dev/terms-of-service).
 
 ## Support
 
