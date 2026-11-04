@@ -286,7 +286,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     const content = [
       {
         type: "text",
-        text: [`${label} added to asset ${assetId} (${APP_URL}/asset/${assetId}).`, money(data)]
+        // note: e.g. an end frame of another size was scaled to the start image's.
+        text: [`${label} added to asset ${assetId} (${APP_URL}/asset/${assetId}).`, data.note, money(data)]
           .filter(Boolean)
           .join("\n"),
       },
@@ -425,8 +426,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     .string()
     .default("")
     .describe(
-      "Work from one image of an existing frame instead of the asset's base: pass an image key exactly as " +
-        "get_asset lists it. Empty = the asset's current base image."
+      "Work from one image instead of the asset's base: an image key from any of your assets (as get_asset " +
+        "lists it), or its cdn.voidless.dev URL. Empty = the asset's current base image."
     );
   const frameId = z
     .number()
@@ -628,7 +629,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     "get_asset",
     "Show one asset with every frame: frame ids, types (animation, rotations - 8-way, edit - text, layer…), " +
       "names, facings and image keys. Frame ids are what frameIndex/items/frameId take elsewhere; image keys " +
-      "are what referenceFile and end_frame take. Free.",
+      "are what referenceFile and end_frame take, on this asset or any other of yours. Free.",
     { id: assetId, preview: z.boolean().default(true).describe("Include the base image inline") },
     readTool("Get asset"),
     tool(async ({ id, preview }) => {
@@ -838,7 +839,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       prompt: z.string().describe("What to change"),
       referenceFile,
       frameId,
-      images: z.array(z.string()).max(4).default([]).describe("Optional extra reference images: image keys from get_asset or https URLs"),
+      images: z.array(z.string()).max(4).default([]).describe("Optional extra reference images: image keys from any of your assets (get_asset lists them), or their cdn.voidless.dev URLs. Other links are refused: upload the picture first"),
       remove_bg: z.boolean().default(true).describe("Remove the background from the result, as the app's editor does. Set false for artwork or a scene that should keep its background"),
     },
     writeTool("Edit image"),
@@ -1043,7 +1044,11 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       id: assetId,
       prompt: z.string().describe("The motion, e.g. 'walk cycle', 'swings sword overhead'"),
       referenceFile,
-      end_frame: z.string().default("").describe("Optional image key for the clip to end on (e.g. to loop back to a pose). Empty = free ending"),
+      end_frame: z.string().default("").describe(
+        "Optional image for the clip to end on: an image key from any of your assets (get_asset lists them), or its " +
+          "cdn.voidless.dev URL, e.g. the start image to loop, or another sprite's pose. Empty = free ending. An end " +
+          "image of another size is scaled to the start image's; one of a very different shape is refused (nothing charged)"
+      ),
       frameId,
     },
     writeTool("Animate sprite"),

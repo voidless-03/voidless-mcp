@@ -118,7 +118,9 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 
 **Free game-dev tools** (no credits)
 
-The same tools as [voidless.dev/tools](https://voidless.dev/tools), for any image, not just your library. Inputs are image URLs (a `cdn.voidless.dev` link from `get_asset` works) or base64/data URIs, PNG or GIF, up to 2048x2048, 256 frames and 32 MB per call. Results come back in the chat: images as PNG/GIF, the `.tres` and atlas `.json` as text. They run on Voidless's server: the hosted connector serves them, and the npm package forwards them there with your key (so they need a connection).
+The same tools as [voidless.dev/tools](https://voidless.dev/tools), for any image, not just your library. Inputs are image URLs (a `cdn.voidless.dev` link from `get_asset` or a saved result works), image keys from your library (`assets/…png`, as `get_asset` lists them), or base64/data URIs, PNG or GIF, up to 2048x2048, 256 frames and 32 MB per call. Results come back in the chat: images as PNG/GIF, the `.tres` and atlas `.json` as text.
+
+Results can also be saved to your library (free, private, counts toward your storage), which gives them an asset id and `cdn.voidless.dev` URLs to pass to the next tool instead of base64 (for example `generate_vfx` → `palette_swap` → `add_outline` → `animate_sprite`). `generate_vfx` saves its effect by default (with its recipe, so it can be rendered again; `save: false` skips it); `palette_swap`, `add_outline`, `pack_sprite_sheet`, `slice_sprite_sheet` and `make_gif` save only when you pass `save: true`. They run on Voidless's server: the hosted connector serves them, and the npm package forwards them there with your key (so they need a connection).
 
 | Tool | What it does |
 | --- | --- |
@@ -142,7 +144,7 @@ Generation tools create new content in your library; none deletes or overwrites 
 
 ## Privacy Policy
 
-This server sends your prompts, any images you pass in, and your API key to the Voidless API (api.voidless.dev) to run generations; results are stored in your Voidless account. The free tools send their inputs to mcp.voidless.dev, which processes them in memory and stores nothing; each call is logged against your account (tool, time taken, success, result size) for usage statistics. It collects nothing else and keeps no local data. See the [Voidless Privacy Policy](https://voidless.dev/privacy-policy) for how Voidless collects, uses, stores, shares and retains data, and the [Terms of Service](https://voidless.dev/terms-of-service).
+This server sends your prompts, any images you pass in, and your API key to the Voidless API (api.voidless.dev) to run generations; results are stored in your Voidless account. The free tools send their inputs to mcp.voidless.dev, which processes them in memory and stores nothing unless a result is saved to your library (`generate_vfx` by default, the others with `save: true`), where it is kept like any other asset of yours; each call is logged against your account (tool, time taken, success, result size) for usage statistics. It collects nothing else and keeps no local data. See the [Voidless Privacy Policy](https://voidless.dev/privacy-policy) for how Voidless collects, uses, stores, shares and retains data, and the [Terms of Service](https://voidless.dev/terms-of-service).
 
 ## Support
 
