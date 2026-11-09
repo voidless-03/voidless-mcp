@@ -22,12 +22,112 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { Agent, setGlobalDispatcher } from "undici";
 
+/**
+ * generate_image's style image as the API takes it. A key or URL goes as `styleFile` (the server checks
+ * it is on one of the caller's assets and loads it at full size) and `styleImage` is sent empty, as the
+ * API's `!== ""` checks expect; base64 stays in `styleImage`.
+ */
+export function styleRef(styleImage, styleAssetId) {
+  const s = typeof styleImage === "string" ? styleImage.trim() : "";
+  const named = /^https?:\/\//i.test(s) || /^assets\//.test(s);
+  const out = { styleImage: named ? "" : s };
+  if (named) out.styleFile = s;
+  if (Number.isInteger(styleAssetId)) out.styleAssetId = styleAssetId;
+  return out;
+}
+
 // Node's fetch gives up after 5 minutes without response headers. Generation calls answer only
 // when the job is done, and an 8-direction animation set can run longer, so wait as long as the
 // server does.
 setGlobalDispatcher(new Agent({ headersTimeout: 0, bodyTimeout: 0, connectTimeout: 30_000 }));
 
-export const VERSION = "1.7.0";
+/** The longest generate_image prompt: 1000 for an asset sheet (artwork at 2048 / "4k"), else 300. */
+export function promptLimit(type, size) {
+  return type === "artwork" && (size === 2048 || size === "4k" || size === 3840) ? 1000 : 300;
+}
+
+/**
+ * generate_asset_set / add_to_asset_set's text: the estimate first, then what was made, each piece's
+ * tags (what rotate_sprite and the animation tools read) and its view check, and the redraw offer.
+ * `appUrl` links the assets.
+ */
+export function assetSetText(data, appUrl = "https://voidless.dev") {
+  const d = data || {};
+  const est = d.estimate || {};
+  const lines = [];
+  const priceLine = `Estimate: ${est.credits} credits = ${est.sheets} sheet(s) x ${est.sheetPrice} + ${est.cuts} cut(s) x ${est.cutPrice}.`;
+  if (d.estimate_only) {
+    lines.push(`Asset set plan (${d.view}${d.set_id ? `, adding to set ${d.set_id}` : ""}), nothing spent yet.`, priceLine);
+    for (const s of d.sheets || []) lines.push(`  Sheet ${s.sheet}: ${s.kind}s, ${s.aspect} ${s.cols}x${s.rows}: ${s.items.join(", ")}`);
+    lines.push("Call again without estimate_only to make it.");
+    return lines.join("\n");
+  }
+  lines.push(`Asset set ${d.set_id} (${d.view}, style ${d.style}${d.style_words ? `, "${d.style_words}"` : ""}` +
+    `${d.style_asset_id ? `, styled from asset ${d.style_asset_id}` : ""}).`);
+  lines.push(priceLine + ` Charged: ${d.cost} credits.` + (typeof d.credits === "number" ? ` Credits left: ${d.credits}.` : ""));
+  if (d.tags) {
+    lines.push(`Pieces are tagged dimension "${d.tags.dimension}", characters facing "${d.tags.facing}"` +
+      (d.tags.rotate !== d.tags.dimension ? ` (rotations drawn in the "${d.tags.rotate}" camera)` : "") + ".");
+  }
+  for (const s of d.sheets || []) lines.push(`Sheet #${s.asset_id} (${s.aspect}): ${s.items.join(", ")} · ${appUrl}/asset/${s.asset_id}`);
+  const verdict = (p) => (p.ok === true ? `view OK (${p.check}${p.symmetry != null ? `, symmetry ${p.symmetry}` : ""})`
+    : p.ok === false ? `VIEW CHECK FAILED: ${p.reason}` : p.check === "none" ? "view not judged" : `view not checked`);
+  const world = (p) => (p.world_height ? ` · world height ${p.world_height}${p.world_height_source ? ` (${p.world_height_source})` : ""}` : "");
+  for (const p of d.pieces || []) {
+    lines.push(`#${p.asset_id} ${p.name} (${p.kind}${p.body ? `/${p.body}` : ""}, ${p.dimension}${p.facing ? `, facing ${p.facing}` : ""})` +
+      `${p.mirrored ? " mirrored to face right" : ""}${world(p)} · ${verdict(p)} · ${appUrl}/asset/${p.asset_id}`);
+  }
+  if ((d.pieces || []).some((p) => p.world_height)) {
+    lines.push(`World heights are in heights of ${d.reference && d.reference.name ? `"${d.reference.name}"` : "the reference character"} (= 1). ` +
+      "Size pieces in a game from them (and from export_godot_spriteframes' scale data), not from their image size.");
+  }
+  if ((d.missing || []).length) lines.push(`Not cut out: ${d.missing.join(", ")}.`);
+  for (const e of d.errors || []) lines.push(`Sheet ${e.sheet} ${e.step} failed (${e.items.join(", ")}): ${e.error}. Not charged.`);
+  if (d.redraw) {
+    lines.push(`To redraw ${d.redraw.items.join(", ")} in the same style (a small sheet for just those): ` +
+      `add_to_asset_set {set_id: ${d.set_id}, redraw_failed: true}, ${d.redraw.credits} credits. Ask the user first.`);
+  } else if ((d.pieces || []).length) {
+    lines.push("Every piece is in the set's view: rotate_sprite / generate_animation_set use these tags as they are.");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * get_asset's world-scale lines (docs/features/world-scale.md): the asset's height in world units and
+ * px per unit, and how to read the frames' sprite_scale. null when the asset has none yet.
+ */
+export function worldText(meta = {}, frames = []) {
+  const scaled = (frames || []).filter((f) => Number(f.sprite_scale) > 0);
+  if (!(meta.world_height > 0) && !scaled.length) return null;
+  const bits = [];
+  if (meta.world_height > 0) {
+    bits.push(`World height: ${meta.world_height} units${meta.world_height_source ? ` (${meta.world_height_source}` +
+      `${meta.world_ref && meta.world_ref.name ? `, against "${meta.world_ref.name}"` : ""})` : ""}` +
+      (meta.px_per_unit > 0 ? ` · ${meta.px_per_unit} px per unit in the base image` : ""));
+  }
+  if (scaled.length) {
+    const values = [...new Set(scaled.map((f) => f.sprite_scale))];
+    bits.push(`Frames carry sprite_scale = the character's pixel scale in that frame against the base image ` +
+      `(${values.length > 4 ? `${Math.min(...values)}-${Math.max(...values)}` : values.join(", ")} here): px per unit there = ` +
+      `${meta.px_per_unit > 0 ? meta.px_per_unit : "px_per_unit"} x sprite_scale. For a game use export_godot_spriteframes ` +
+      `with asset_id (it evens the clips out), not one scale for every clip.`);
+  }
+  return bits.join("\n");
+}
+
+// The pixel-art sizes, as everywhere else in Voidless (strapi helpers/pixel PIXEL_SIZES). 48, 96, 192
+// and 384 sit between the classic 32/64/128/256.
+export const PIXEL_SIZES = [32, 48, 64, 96, 128, 192, 256, 384];
+const PIXEL_SIZE_TEXT = "32, 48, 64, 96, 128, 192, 256 or 384";
+
+/** A size field that takes exactly these values (numbers, plus any string literal such as "4k"). */
+export function sizeSchema(...sizes) {
+  return z.union(sizes.map((s) => z.literal(s)));
+}
+
+// From package.json, so /health, the client header and serverInfo (what directory inspectors record)
+// can't fall behind the release again: this constant said 1.7.0 while 1.8.2 shipped (Nov 9 2026).
+export const VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
 const BASE_URL = process.env.VOIDLESS_API_URL || "https://api.voidless.dev";
 const CDN_URL = "https://cdn.voidless.dev";
 // Where asset links point. Results link to the asset's page in the app rather than to raw GIFs: the
@@ -49,7 +149,7 @@ const GALLERY_TOOLS = [
   "generate_image", "upload_image", "edit_image", "make_normal_map", "make_glow_map", "rotate_sprite", "animate_sprite", "generate_animation_set",
   "flip_left_side", "generate_video", "generate_sfx", "generate_music", "generate_3d_model", "get_asset",
   "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite", "check_generation",
-  "render_3d_sprites",
+  "render_3d_sprites", "resize_sprite", "match_palette", "generate_asset_set", "add_to_asset_set",
 ];
 const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "utf8");
 
@@ -62,9 +162,14 @@ const LONG_PATHS = new Set([
   "/generate/image", "/generate/image-edit", "/generate/bbox-edit", "/generate/image-rotations", "/generate/image-parts",
   "/generate/image-animation", "/generate/multi-animation", "/generate/video", "/generate/video-extend",
   "/generate/sfx", "/generate/music", "/generate/3d-model", "/generate/model-rig", "/generate/model-animation",
-  "/generate/model-sprites",
+  "/generate/model-sprites", "/generate/asset-set",
+  // Free, but a character with many clips takes minutes to resize.
+  "/generate/resize", "/generate/match-palette",
 ]);
-const WAIT_MS = Number(process.env.VOIDLESS_WAIT_MS) || 80_000;
+// 45 s, not longer: MCP clients give up on a tool call well before Cloudflare's 100 s (Claude's MCP proxy
+// at ~60 s), and a call that times out on the client side never shows the job key below, so the
+// assistant can't fetch the result and may pay for a second one. Reply with the job well inside that.
+const WAIT_MS = Number(process.env.VOIDLESS_WAIT_MS) || 45_000;
 const CUT_OFF = /\((502|504|520|522|524)\)|fetch failed|ECONNRESET|socket|terminated|other side closed/i;
 
 class PendingJob extends Error {
@@ -237,14 +342,16 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
 
   // One line per frame, carrying everything a follow-up call needs: the frame id (frameIndex /
   // items / frameId elsewhere) and the image keys (referenceFile / end_frame / imageIndex).
-  function frameLine(frame) {
+  function frameLine(frame, { allKeys = false } = {}) {
     const images = Array.isArray(frame.images) ? frame.images : [];
     const bits = [`frame ${frame.id}`, frame.type || "frame", frame.name ? `"${frame.name}"` : null];
     if (frame.tags) bits.push(`${isRotation(frame) ? "facings" : "tags"}: ${frame.tags}`);
+    if (frame.size) bits.push(`${frame.size}px frames`);
+    if (Number(frame.sprite_scale) > 0) bits.push(`sprite_scale ${frame.sprite_scale}`);
     const imageText =
-      images.length <= 8
+      images.length <= 8 || allKeys
         ? images.map((k, i) => `      [${i}] ${k}`).join("\n")
-        : `      ${images.length} images, first ${images[0]}, last ${images[images.length - 1]}`;
+        : `      ${images.length} images, first ${images[0]}, last ${images[images.length - 1]} (get_asset with frameId lists them all)`;
     return `  - ${bits.filter(Boolean).join(" · ")}${images.length ? "\n" + imageText : ""}`;
   }
 
@@ -262,10 +369,31 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
   }
 
   // Responses that create a new asset: { file, assetId, credits, cost, … }.
-  async function assetResult(data, label) {
+  // Which style preset an image was drawn in and why (the image route always picks exactly one).
+  const STYLE_SOURCES = {
+    explicit: "as asked",
+    mapped: "nearest preset to the style given",
+    prompt: "named in the prompt",
+    default: "default",
+  };
+  function styleLine(data) {
+    if (!data || !data.style || !STYLE_SOURCES[data.styleSource]) return null;
+    const why = data.styleUnknown
+      ? `default; no preset matches style "${data.styleUnknown}"`
+      : data.styleSkipped
+        ? `default; "${data.styleSkipped}" in the prompt needs size 512 or 1024`
+        : STYLE_SOURCES[data.styleSource];
+    const palette = data.palettePreset && data.palettePreset !== "none"
+      ? ` · palette ${data.palettePreset}${data.paletteSource === "prompt" ? " (named in the prompt)" : ""}`
+      : "";
+    return `Style preset: ${data.style} (${why})${palette}`;
+  }
+
+  async function assetResult(data, label, extra = []) {
     const url = cdnUrl(data.file);
     const lines = [
       `${label} created.`,
+      ...extra,
       data.assetId ? `Asset ID: ${data.assetId} · ${APP_URL}/asset/${data.assetId}` : null,
       url && !mimeFromPath(url).startsWith("image/") ? `File: ${url}` : null,
       data.thumbnail ? `Thumbnail: ${cdnUrl(data.thumbnail)}` : null,
@@ -327,9 +455,13 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
         content.push({ type: "text", text: `Asset ${result.assetId}: skipped${result.error ? ` (${result.error})` : ""}` });
         continue;
       }
+      // A clip that had to grow onto a bigger canvas: the character is the same pixel size, the frame bigger.
+      const grown = (result.grown || []).map((g) => `"${g.name}" came out on ${g.size}px frames (the sprite is ${g.sourceSize}px)`);
       content.push({
         type: "text",
-        text: `Asset ${result.assetId} (${APP_URL}/asset/${result.assetId}):\n` + (result.frames || []).map(frameLine).join("\n"),
+        text: `Asset ${result.assetId} (${APP_URL}/asset/${result.assetId}):\n` + (result.frames || []).map(frameLine).join("\n") +
+          (grown.length ? `\n  Bigger canvas: ${grown.join("; ")}. The character is the same pixel size in every clip; ` +
+            "line clips up by their feet anchor, don't scale them to one frame size." : ""),
       });
       for (const frame of result.frames || []) {
         if (inlined >= MAX_INLINE_IMAGES) break;
@@ -629,18 +761,37 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     "get_asset",
     "Show one asset with every frame: frame ids, types (animation, rotations - 8-way, edit - text, layer…), " +
       "names, facings and image keys. Frame ids are what frameIndex/items/frameId take elsewhere; image keys " +
-      "are what referenceFile and end_frame take, on this asset or any other of yours. Free.",
-    { id: assetId, preview: z.boolean().default(true).describe("Include the base image inline") },
+      "are what referenceFile and end_frame take, on this asset or any other of yours. Long clips show their first " +
+      "and last key; pass frameId to list every key of that frame. Each key downloads at its exact pixels from " +
+      "https://cdn.voidless.dev/<key>. Also its world height (in heights of the hero / its set's reference character) " +
+      "and each frame's sprite_scale (how big the character is drawn there against the base: video clips are " +
+      "usually ~0.57): size it in a game from these, never by eye. Free.",
+    {
+      id: assetId,
+      frameId: z.number().int().optional().describe("Show only this frame, with every image key"),
+      preview: z.boolean().default(true).describe("Include the base image inline"),
+    },
     readTool("Get asset"),
-    tool(async ({ id, preview }) => {
+    tool(async ({ id, frameId, preview }) => {
       const a = await apiGet(`/assets/${id}`);
       const meta = a.meta_data || {};
       const frames = (meta.frames || []).filter((f) => !f.archived);
+      if (frameId !== undefined) {
+        const frame = frames.find((f) => f.id === frameId);
+        if (!frame) throw new Error(`Asset ${id} has no frame ${frameId}. Use get_asset ${id} for its frame ids.`);
+        const content = [{ type: "text", text: `Asset ${a.id} · frame ${frame.id}:\n${frameLine(frame, { allKeys: true })}` }];
+        if (preview) {
+          const image = await inlineImage(stillOf(frame));
+          if (image) content.push(image);
+        }
+        return { content };
+      }
       const lines = [
         `Asset ${a.id} · ${a.type}${meta.image_type ? "/" + meta.image_type : ""} · ${APP_URL}/asset/${a.id}`,
         a.prompt ? `Prompt: ${a.prompt}` : null,
         `Tags: ${a.tags || "(none)"}`,
         meta.size ? `Size: ${meta.size}px · ${meta.dimension || ""} · style ${meta.style || "-"} · facing ${meta.facing || "-"}` : null,
+        worldText(meta, frames),
         a.file ? `Base image: ${a.file}` : null,
         meta.rigged_file ? `Rigged: yes (${(meta.animations || []).length} animations)` : null,
         Array.isArray(meta.video_extensions) && meta.video_extensions.length
@@ -669,11 +820,15 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       const data = await apiGet("/generate/multi-animation/presets");
       const presets = (data.presets || []).map((p) => `- ${p.key} (${p.label}): ${p.actions.join(", ")}`);
       const perClip = Number(data.pricePerClip) > 0 ? Number(data.pricePerClip) : 15;
+      const perHdClip = Number(data.pricePerHdClip) > 0 ? Number(data.pricePerHdClip) : 25;
+      const perHdRunClip = Number(data.pricePerHdRunClip) > 0 ? Number(data.pricePerHdRunClip) : 30;
       return {
         content: [
           {
             type: "text",
-            text: `Presets:\n${presets.join("\n")}\n\n${perClip} credits per clip (mirrored left-side clips are free). ` +
+            text: `Presets:\n${presets.join("\n")}\n\n${perClip} credits per clip, ${perHdClip} for a 1024 HD image ` +
+              `(drawn at 1080P), ${perHdRunClip} for a looping walk/run on a 1024 HD image (a 2 s clip); ` +
+              "mirrored left-side clips are free. " +
               `Up to ${data.maxImages} images per run.`,
           },
         ],
@@ -751,18 +906,31 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
 
   server.tool(
     "generate_image",
-    "Generate a game sprite/asset image. Infer every field from the request: art STYLE, colour PALETTE, " +
-      "asset TYPE, output SIZE and PERSPECTIVE; for characters also facing/pose/bodyType. Use the default model " +
-      "(flux2-klein, 1 credit) unless the user names another. Costs by model: flux2-klein 1, flux-juggernaut 1, " +
-      "seedream-5-flash 10, gpt-image-2.5 5, retro-diffusion 10, nano-banana-2 15 credits (a reference image makes it " +
-      "2 and uses flux2-klein). Call it once per request and " +
-      "show the result; ask the user before generating again (each call spends credits).",
+    "Generate a game sprite/asset image. For an item, weapon or icon the user describes, use this, not the free generate_items. " +
+      "Infer every field from the request: art STYLE, colour PALETTE, " +
+      "asset TYPE, output SIZE and PERSPECTIVE; for characters also facing/pose/bodyType. Leave model out unless the user names one: " +
+      "the server then picks by size (flux2-klein, 1 credit, up to 64 px; gpt-image-2.5, 3 credits, from 96 px). Costs by model: flux2-klein 1, flux-juggernaut 1, " +
+      "seedream-5-flash 10, gpt-image-2.5 3, gpt-image-2.6 10, retro-diffusion 10, nano-banana-2 15 credits (a reference image makes it " +
+      "2 and uses flux2-klein). ASSET SHEETS: type 'artwork' + model 'gpt-image-2.6' + size 2048 (20 credits) or '4k' " +
+      "(30 credits) draws one big picture holding a whole matching set (e.g. 'nine fantasy RPG items in a grid, clear space " +
+      "between them, plain light background') at full resolution; cut it into one asset per item with extract_parts " +
+      "save_as 'assets' (each cut-out a 1024 sprite). Call it once per request and " +
+      "show the result; ask the user before generating again (each call spends credits). Every image is drawn in " +
+      "exactly one of Voidless's fixed style presets, and the result says which one was used and why.",
     {
-      prompt: z.string().max(300).describe("The subject only (max 300 chars). Put style/colour in the style/palette fields."),
+      prompt: z
+        .string()
+        .max(1000)
+        .describe(
+          "The subject (max 300 chars; an asset sheet, type 'artwork' at size 2048 or '4k', up to 1000 so each item " +
+            "and its view can be named). Prefer the style/palette fields; if style is empty, a style the prompt names " +
+            "(e.g. 'watercolour frost mage', 'a cel-shaded golem') picks that preset and those words are taken out of the " +
+            "prompt, so the preset's own style words are the only ones the model sees."
+        ),
       model: z
-        .enum(["flux2-klein", "gpt-image-2.5", "seedream-5-flash", "nano-banana-2", "retro-diffusion", "flux-juggernaut"])
-        .default("flux2-klein")
-        .describe("The default, flux2-klein, unless the user asks for a specific model by name."),
+        .enum(["flux2-klein", "gpt-image-2.5", "gpt-image-2.6", "seedream-5-flash", "nano-banana-2", "retro-diffusion", "flux-juggernaut"])
+        .optional()
+        .describe("Only when the user names a model. Left out, the server picks by size: flux2-klein up to 64 px, gpt-image-2.5 from 96 px."),
       type: z
         .enum(["object", "character", "character portrait", "artwork", "tileset", "ui"])
         .describe(
@@ -771,22 +939,35 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
             "tilesetKind; below 512 it is drawn at 512 and pixelated); 'ui' = interface pieces (see uiMode)."
         ),
       dimension: z.enum(["2d", "top down", "isometric"]).default("2d").describe("'2d' = side view, 'top down' = overhead, 'isometric' = 2.5D"),
-      size: z
-        .union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)])
+      size: sizeSchema(...PIXEL_SIZES, 512, 768, 1024, 2048, "4k")
         .default(512)
-        .describe("Output px. 32/64/128/256 give a pixel-art look; 512 for every other style; 1024 for high-res."),
-      colours: z.number().int().min(4).max(12).default(8).describe("Colour count for pixel-art reduction (4–12)"),
+        .describe(
+          "Output px. 32, 48, 64, 96, 128, 192, 256 and 384 give pixel art; 512 for every other style; 768 for a sharper smooth sprite (drawn at 1024, stored at 768); 1024 for high-res. 2048 and '4k' are " +
+            "ASSET-SHEET sizes, only for type 'artwork' with model 'gpt-image-2.6' in a smooth (not pixel) style: 2048 = " +
+            "2048x2048 (aspect '16:9': 2560x1440), '4k' = 2880x2880 (aspect '16:9': 3840x2160), kept at that size. For a " +
+            "set of matching assets to cut apart with extract_parts save_as 'assets'."
+        ),
       style: z
         .string()
         .default("")
         .describe(
           "Style preset: pixel-art, cartoon, cel-shading, flat, hand-drawn, paper-cutout, comic-book, anime, watercolor, " +
-            "low-poly, 3d-render, claymation, photorealistic, voxel. Empty = pixel art below 512, cartoon otherwise."
+            "low-poly, 3d-render, claymation, photorealistic, voxel. Always ends up as one of these: another value is " +
+            "mapped to the nearest preset ('watercolour', '8-bit', 'realistic'), or the default if none fits. Empty = the " +
+            "preset the prompt names, at 512/1024 for non-pixel styles (at 32-384 the result is pixel art); otherwise " +
+            "pixel art below 512, cartoon at 512/1024."
         ),
       palette: z
-        .enum(["none", "black-and-white", "retro", "vibrant", "pastel", "neon", "earthy", "gameboy", "sepia"])
+        .enum(["none", "black-and-white", "retro", "vibrant", "pastel", "neon", "earthy", "gameboy", "sepia", "nes", "pico8", "c64", "cga", "endesga32", "sunset", "ice", "dungeon", "forest", "desert", "candy", "cyberpunk"])
         .default("none")
-        .describe("Colour-scheme preset, independent of style. 'none' keeps the style's own colours."),
+        .describe(
+          "Colour-scheme preset, independent of style. 'none' = the palette the prompt names (e.g. 'in a neon palette', " +
+            "'greyscale'), else the style's own colours. Pixel art (32-384 px, or a pixel style) is also held to the " +
+            "preset's colours: gameboy (the 4 DMG greens), cga (4), pico8 (16 fixed), c64 (16 fixed), nes (16 from the " +
+            "NES set), endesga32 (32 fixed), black-and-white (5 greys), sepia (8); retro, earthy, sunset, ice, dungeon, " +
+            "forest, desert, candy and cyberpunk set the mood and cap the colours (12-16). Edits, rotations and " +
+            "animations of the asset keep its palette. There is no colour-count setting: Voidless picks it by size."
+        ),
       facing: z.enum(["forward", "right"]).default("forward").describe("Characters: front view or side profile. Side profiles rotate best."),
       pose: z
         .enum(["idle", "tpose"])
@@ -804,29 +985,59 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
           "type 'tileset' only: 'platformer' = side-view 3x3 ground sheet (default for 2d); 'wang' = top-down two-terrain " +
             "4x5 auto-tile sheet in the free Tileset Generator's layout (default for top down; name both terrains, e.g. " +
             "'a cobblestone path in grass'), every edge matched so any arrangement tiles seamlessly; 'blob17' = top-down " +
-            "17-piece sheet of one terrain on transparent. Top-down sheets have 256 px tiles; size 32/64/128 returns pixel tiles"
+            "17-piece sheet of one terrain on transparent. Top-down sheets have 256 px tiles; a pixel size returns pixel tiles at that size (up to 256)"
         ),
       aspect: z
         .enum(["1:1", "16:9"])
         .default("1:1")
-        .describe("type 'artwork' at size 512 or 1024 only: '16:9' for a backdrop, scene or game background (1344x756 at 1024, 672x378 at 512; pixel-art styles come out on a 4 px grid, 672x376 at 512). Smaller sizes, Retro Diffusion and everything that is not artwork are always 1:1"),
+        .describe("type 'artwork' at size 512, 1024, 2048 or '4k' only: '16:9' for a backdrop, scene or game background (1344x756 at 1024, 672x378 at 512; pixel-art styles come out on a 4 px grid, 672x376 at 512; 2560x1440 at 2048, 3840x2160 at '4k'). Smaller sizes, Retro Diffusion and everything that is not artwork are always 1:1"),
       uiMode: z
         .enum(["graphic", "title", "text"])
         .default("graphic")
         .describe("type 'ui' only: 'graphic' = button/panel/HUD piece, 'title' = game-title wordmark spelling the prompt, 'text' = plain label spelling the prompt"),
       seed: z.number().int().min(0).default(0).describe("RNG seed (0 = random)"),
       referenceImage: z.string().default("").describe("Optional raw base64 image (no data: prefix) to base the result on"),
-      styleImage: z.string().default("").describe("Optional raw base64 image whose art style to copy"),
+      styleImage: z
+        .string()
+        .default("")
+        .describe(
+          "Optional image whose art style to copy: an image key from one of your assets (get_asset lists them, e.g. " +
+            "assets/64/images/<id>.png) or its cdn.voidless.dev URL. The server loads it at full resolution. Prefer " +
+            "this (or styleAssetId) over base64: get_image_data only returns a small thumbnail. With gpt-image-2.6 " +
+            "the picture itself is shown to the model; other models get a description of its style"
+        ),
+      styleAssetId: z
+        .number()
+        .int()
+        .optional()
+        .describe("Optional: the id of one of your image assets whose art style to copy (its main image, full resolution). Same as passing its image key as styleImage"),
     },
     writeTool("Generate image"),
-    tool(async ({ facing, pose, bodyType, palette, uiMode, tilesetKind, aspect, ...rest }) => {
+    tool(async ({ facing, pose, bodyType, palette, uiMode, tilesetKind, aspect, styleAssetId, ...rest }) => {
+      const sheetSized = rest.size === 2048 || rest.size === "4k";
+      if (String(rest.prompt || "").length > promptLimit(rest.type, rest.size)) {
+        throw new Error(
+          `prompt is ${String(rest.prompt).length} characters; the limit is 300 (1000 for an asset sheet: type 'artwork' ` +
+            "at size 2048 or '4k'). For a whole set drawn in the game's camera view, use generate_asset_set."
+        );
+      }
+      if (sheetSized) {
+        if (rest.type !== "artwork" || rest.model !== "gpt-image-2.6") {
+          throw new Error(
+            `size ${rest.size} is an asset-sheet size: only for type 'artwork' with model 'gpt-image-2.6'. ` +
+              "Use 512, 768 or 1024 otherwise."
+          );
+        }
+        if (rest.size === "4k") rest.size = 3840;
+      }
       const wide = rest.type === "artwork" && aspect === "16:9" ? "16:9" : "1:1";
       const tileset = rest.type === "tileset";
       // Tilesets are GPT-Image only (the server enforces it too); the kind rides in options.mode.
       if (tileset) rest.model = "gpt-image-2.5";
       const mode = tileset ? tilesetKind || "" : uiMode;
-      const body = { ...rest, palette: [], options: { facing, pose, bodyType, palette, mode, aspect: wide } };
-      return assetResult(await apiPost("/generate/image", body), "Image");
+      const body = { ...rest, palette: [], options: { facing, pose, bodyType, palette, mode, aspect: wide }, ...styleRef(rest.styleImage, styleAssetId) };
+      const data = await apiPost("/generate/image", body);
+      return assetResult(data, "Image", [styleLine(data)]);
     })
   );
 
@@ -910,7 +1121,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     "rotate_sprite",
     "Turn a sprite into an 8-way set (front, back, sides and diagonals) in one pass. The result is a " +
       "'rotations - 8-way' frame whose facings line up with its images; pass those to generate_animation_set " +
-      "to animate each direction. Works best from a side-profile sprite. 10 credits.",
+      "to animate each direction. Works best from a side-profile sprite. 20 credits.",
     { id: assetId, referenceFile, frameId },
     writeTool("Rotate sprite (8-way)"),
     tool(async (args) => framesResult(await apiPost("/generate/image-rotations", args), args.id, "8-way rotation"))
@@ -918,17 +1129,44 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
 
   server.tool(
     "extract_parts",
-    "Split a character sprite into separate body parts (head, torso, arms, legs…) as 'layer' frames, for " +
-      "rigging or cut-out animation. 10 credits. Call get_asset afterwards for the parts' frame ids.",
+    "Cut an image into its separate pieces. Two uses: (1) a sheet of game items (characters, props, trees...) " +
+      "into one NEW asset per item (the default, save_as 'assets'): each item at its own proportions, framed on " +
+      "a square at the sheet's size (1024 for a 2048/4k asset sheet from generate_image, cut from the " +
+      "full-resolution sheet) " +
+      "like a generated sprite (filling the frame), named after the item, a character or an object, in the " +
+      "sheet's projects and style. " +
+      "Those are generated images like any other: rotate_sprite, animate_sprite, generate_animation_set and " +
+      "resize_sprite all take them; (2) a character sprite into body parts (head, torso, arms, legs...) as " +
+      "'layer' frames on that asset, for rigging or cut-out animation: pass save_as 'frames'. 10 credits either " +
+      "way. Frames: call get_asset afterwards for their ids.",
     {
       id: assetId,
-      prompt: z.string().default("").describe("Optional: which parts to cut out. Empty = the standard rig parts"),
+      prompt: z.string().default("").describe("Optional: which parts to cut out. Empty = every separate item (assets) or the standard rig parts (frames)"),
+      save_as: z.enum(["assets", "frames"]).default("assets")
+        .describe("assets = each piece saved as its own new asset (default); frames = body-part layer frames on this asset, for rigging"),
+      asset_type: z.enum(["auto", "character", "object"]).default("auto")
+        .describe("save_as 'assets' only: the new assets' type. auto = character when the item's name is one (hero, golem, slime, wolf...), else object"),
       referenceFile,
       frameId,
     },
     writeTool("Extract sprite parts"),
     tool(async (args) => {
       const data = await apiPost("/generate/image-parts", args);
+      if (args.save_as === "assets") {
+        const assets = Array.isArray(data.assets) ? data.assets : [];
+        const lines = [
+          `Saved ${assets.length} item${assets.length === 1 ? "" : "s"} from asset ${args.id} as new assets:`,
+          ...assets.map((a) => `#${a.id} ${a.prompt} (${a.image_type}) · ${APP_URL}/asset/${a.id}`),
+          money(data),
+        ].filter(Boolean);
+        const content = [{ type: "text", text: lines.join("\n") }];
+        for (const a of assets.slice(0, MAX_INLINE_IMAGES)) {
+          const image = await inlineImage(a.file);
+          if (image) content.push(image);
+        }
+        const items = assets.map((a) => mediaItem(a.file, `#${a.id} ${a.prompt || ""}`.trim(), { link: `${APP_URL}/asset/${a.id}` }));
+        return withGallery({ content }, items, "Items");
+      }
       // The ids returned here are off by (parts - 1): the server numbers from the last appended
       // frame. Point at get_asset instead of printing ids that would misdirect a follow-up call.
       const names = (data.frames || []).map((f) => f.name).filter(Boolean);
@@ -943,31 +1181,105 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     })
   );
 
+  // Asset sets (docs/features/asset-sets.md): sheets drawn in the game's camera view, cut, tagged and checked.
+  const assetSetItem = z.object({
+    name: z.string().min(1).max(80).describe("What it is, e.g. 'knight', 'ice golem', 'treasure chest'"),
+    kind: z.enum(["character", "object", "tile"]).optional()
+      .describe("character (rotated and animated), object (a prop) or tile. Omitted: guessed from the name"),
+    body: z.enum(["humanoid", "quadruped", "blob", "flying"]).optional()
+      .describe("Characters: body plan (a wolf is quadruped, a slime blob, a bat flying). Omitted: guessed"),
+    notes: z.string().max(240).optional().describe("Optional details: colours, outfit, what it holds"),
+    shape: z.enum(["tall", "wide", "square"]).optional().describe("Optional: how it fits a cell (a tree is tall, a cart wide). Omitted: guessed"),
+    size: z.number().min(0.05).max(50).optional()
+      .describe("Its height in the game world, as a multiple of the set's reference character (the hero = 1): a boss golem 2.5, a slime 0.5, a door 1.2. Wins over the height the sheet draws (sheets often draw a boss barely bigger than the hero). Give it whenever relative size matters"),
+    reference: z.boolean().optional().describe("This item is the set's unit of height (default: the first humanoid character)"),
+  });
+  async function assetSetResult(data, label) {
+    const content = [{ type: "text", text: assetSetText(data, APP_URL) }];
+    for (const p of (data.pieces || []).slice(0, MAX_INLINE_IMAGES)) {
+      const image = await inlineImage(p.file);
+      if (image) content.push(image);
+    }
+    const items = [
+      ...(data.pieces || []).map((p) => mediaItem(p.file, `#${p.asset_id} ${p.name}${p.ok === false ? " (view check failed)" : ""}`, { link: `${APP_URL}/asset/${p.asset_id}` })),
+      ...(data.sheets || []).map((s) => mediaItem(s.file, `Sheet #${s.asset_id}`, { link: `${APP_URL}/asset/${s.asset_id}` })),
+    ];
+    return withGallery({ content }, items, label);
+  }
+
+  server.tool(
+    "generate_asset_set",
+    "Make a whole matching game art set in the game's CAMERA VIEW: characters, props and tiles drawn on 2048 " +
+      "GPT-Image 2.6 sheets, cut into one asset per item, each tagged with the view's dimension and facing so " +
+      "rotate_sprite and the animation tools use the right angle. view: 'platformer' (side profile facing right, eye " +
+      "level), 'topdown' (classic RPG, ~45° camera, characters head-on and symmetrical), 'topdown-overhead' (straight " +
+      "down), 'isometric'. Items are planned onto sheets (about 3-4 characters, 4-6 objects or 3 tall props a sheet; " +
+      "the first sheet, or style_asset_id, is the style every later sheet copies at full resolution). Cost: 20 a " +
+      "sheet + 10 a cut; pass estimate_only to see the plan and price first. Every piece gets a free view check " +
+      "(head-on for top-down, a profile for platformer) and failures are reported with a redraw offer; nothing else " +
+      "is spent (no rotations or animations). Voidless+ only. Returns set_id: add_to_asset_set adds to it later. " +
+      "Every piece gets a world_height in heights of the set's reference character (the first humanoid, or the item " +
+      "marked reference), measured on the sheet before the cut-outs are reframed, or the item's own `size` when given. " +
+      "In a game, size every piece from world_height and the export's scale data (export_godot_spriteframes with " +
+      "asset_id), never by guessing from the image size: all cut-outs are framed to the same pixel height.",
+    {
+      view: z.enum(["platformer", "topdown", "topdown-overhead", "isometric"]).describe("The game's camera view"),
+      items: z.array(assetSetItem).min(1).max(24).describe("Everything the set needs, e.g. [{name:'knight'}, {name:'frost wolf', body:'quadruped'}]"),
+      style: z.string().default("cartoon").describe("Style preset (smooth styles: cartoon, cel-shading, flat, hand-drawn, anime, watercolor, comic-book, 3d-render, ...). Not pixel art: resize_sprite the pieces afterwards"),
+      style_words: z.string().max(300).optional().describe("Optional extra style words for every sheet, e.g. 'muted colours, matte shading, medium outlines'"),
+      palette: z.enum(["none", "black-and-white", "retro", "vibrant", "pastel", "neon", "earthy", "gameboy", "sepia", "nes", "pico8", "c64", "cga", "endesga32", "sunset", "ice", "dungeon", "forest", "desert", "candy", "cyberpunk"]).default("none"),
+      style_asset_id: z.number().int().optional().describe("Optional: an existing sheet (or any image asset) whose style the whole set copies, at full resolution"),
+      estimate_only: z.boolean().default(false).describe("true = only the sheet plan and the price; nothing is drawn or charged"),
+    },
+    writeTool("Generate asset set"),
+    tool(async (args) => assetSetResult(await apiPost("/generate/asset-set", args), "Asset set"))
+  );
+
+  server.tool(
+    "add_to_asset_set",
+    "Add items to an existing asset set (from generate_asset_set), reusing everything it was made with: its view, " +
+      "style preset, style words, palette and style sheet. Or redraw_failed: true draws again, on a small sheet in " +
+      "the same style, just the pieces that failed their view check or were not cut out. Same price: 20 a sheet + 10 " +
+      "a cut; estimate_only shows it first. New pieces get world_height in the same reference character's heights " +
+      "(give `size` for each new item whose size matters: a new sheet has no reference character on it to measure against).",
+    {
+      set_id: z.number().int().describe("The set's id (generate_asset_set's set_id: its first sheet's asset id)"),
+      items: z.array(assetSetItem).max(24).default([]).describe("New items for the set"),
+      redraw_failed: z.boolean().default(false).describe("Also redraw the set's pieces that failed the view check or went missing"),
+      estimate_only: z.boolean().default(false).describe("true = only the plan and the price; nothing is drawn or charged"),
+    },
+    writeTool("Add to asset set"),
+    tool(async (args) => assetSetResult(await apiPost("/generate/asset-set", args), "Asset set"))
+  );
+
   server.tool(
     "upload_image",
-    "Add an image the user already has to their library, so it can be animated, rotated or edited. It must " +
-      "be square at 32, 64, 128, 256, 512 or 1024 px. Free.",
+    "Add an image the user already has to their library, so it can be animated, rotated or edited. The editors " +
+      `work on squares of ${PIXEL_SIZE_TEXT}, 512, 768 or 1024 px; any other picture is centred on the smallest ` +
+      "of those that holds it, with transparent padding (scaled down to 1024 if larger), and the reply says so. " +
+      "Give it as a public URL (best: a long base64 string is easy to garble) or as base64. Free.",
     {
-      image: z.string().describe("Base64 image (a data: prefix is stripped automatically)"),
+      url: z.string().optional().describe("Public http(s) link to the image. Use this when the image is online"),
+      image: z.string().optional().describe("Base64 image instead of url (a data: prefix is stripped automatically)"),
       type: z.enum(["object", "character", "character portrait", "artwork"]).default("character"),
       remove_bg: z.boolean().default(false).describe("Remove the background on upload"),
     },
     writeTool("Upload image"),
-    tool(async ({ image, ...rest }) => {
-      const raw = String(image).replace(/^data:[^,]*,/, "");
-      return assetResult(await apiPost("/upload/image", { image: raw, ...rest }), "Upload");
+    tool(async ({ image, url, ...rest }) => {
+      if (!url === !image) throw new Error(url ? "Give the image as a url or as base64 in image, not both." : "Give the image as a url or as base64 in image.");
+      const body = url ? { url, ...rest } : { image: String(image).replace(/^data:[^,]*,/, ""), ...rest };
+      return assetResult(await apiPost("/upload/image", body), "Upload");
     })
   );
 
   server.tool(
     "pixelate_image",
-    "Convert any image to pixel art at a target size and colour count. Returns the image; nothing is " +
+    "Convert any image to pixel art at a target size (the colour count follows the size). Returns the image; nothing is " +
       "saved to the library. 1 credit.",
     {
       image: z.string().describe("Base64 source image (a data: prefix is stripped automatically)"),
-      size: z.union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]).default(64)
-        .describe("Pixel size. 512 and 1024 are drawn on a real 4x grid (128 / 256 art pixels)"),
-      colours: z.number().int().min(4).max(12).default(8),
+      size: sizeSchema(...PIXEL_SIZES, 512, 768, 1024).default(64)
+        .describe(`Pixel size: ${PIXEL_SIZE_TEXT}, or 512 and 1024, drawn on a real 4x grid (128 / 256 art pixels)`),
     },
     writeTool("Pixelate image"),
     tool(async ({ image, ...rest }) => {
@@ -994,9 +1306,9 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       url: z.string().optional().describe("Public http(s) link to the image or video. Use this for videos"),
       file: z.string().optional().describe("Base64 file instead of url (a data: prefix is stripped automatically)"),
       kind: z.enum(["image", "video"]).optional().describe("What the file is. Inferred from the url's extension when omitted"),
-      style: z.enum(["pixel", "smooth"]).default("pixel").describe("pixel = pixel art at 32-1024; smooth = clean cut-out at 512 or 1024"),
-      size: z.union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512), z.literal(1024)]).optional()
-        .describe("Output size. Default 64 for pixel, 512 for smooth (smooth allows only 512 or 1024)"),
+      style: z.enum(["pixel", "smooth"]).default("pixel").describe("pixel = pixel art at 32-1024; smooth = clean cut-out at 512, 768 or 1024"),
+      size: sizeSchema(...PIXEL_SIZES, 512, 768, 1024).optional()
+        .describe(`Output size. Pixel: ${PIXEL_SIZE_TEXT}, 512 or 1024 (default 64); smooth: 512 (default), 768 or 1024`),
       motion: z.enum(["loop", "once"]).default("loop").describe("Video only: loop = find the cleanest loop; once = keep the whole clip"),
     },
     writeTool("Clean up sprite"),
@@ -1004,7 +1316,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       if (!url && !file) throw new Error("Give the file as a url or as base64 in file.");
       const pixel = style !== "smooth";
       const out = size || (pixel ? 64 : 512);
-      if (!pixel && out !== 512 && out !== 1024) throw new Error("Smooth art comes back at 512 or 1024.");
+      if (!pixel && ![512, 768, 1024].includes(out)) throw new Error("Smooth art comes back at 512, 768 or 1024.");
       const guessed = /\.(mp4|webm|mov|m4v)(\?|$)/i.test(String(url || "")) ? "video"
         : /^data:video\//i.test(String(file || "")) ? "video" : "image";
       const body = { kind: kind || guessed, size: out, pixel, loop: motion };
@@ -1035,11 +1347,22 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
   // Animation
   // ---------------------------------------------------------------------------
 
+  // Room for big moves (image-api fit to room): a character that fills its frame is shrunk a little,
+  // inside the same frame, so kicks and falls don't run off the edge.
+  const room = z.enum(["auto", "on", "off"]).default("auto").describe(
+    "Room for big moves. auto: when the motion is big (a kick, a special, a fall, a jump) and the character " +
+      "fills its frame, it is drawn a little smaller in the same frame so nothing is cut off. on: always do " +
+      "that. off: never. Making one character's moves over several calls, use on for every call so the " +
+      "character stays one size"
+  );
+
   server.tool(
     "animate_sprite",
     "Animate one sprite into a single 16-frame clip from a description of the motion. For several clips " +
       "(walk + run + attack, or every direction) use generate_animation_set instead: one job, " +
-      "15 credits per clip. 15 credits.",
+      "15 credits per clip. 15 credits; 25 for a 1024 HD image (drawn at 1080P), 30 for a looping walk/run on a " +
+      "1024 HD image (walk, stroll, march, sneak, tiptoe, patrol, run, jog, sprint, dash or a charge forward, ending on " +
+      "its start frame: a 2 s clip, played at its own pace).",
     {
       id: assetId,
       prompt: z.string().describe("The motion, e.g. 'walk cycle', 'swings sword overhead'"),
@@ -1050,6 +1373,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
           "image of another size is scaled to the start image's; one of a very different shape is refused (nothing charged)"
       ),
       frameId,
+      room,
     },
     writeTool("Animate sprite"),
     tool(async (args) => framesResult(await apiPost("/generate/image-animation", { ...args, mode: "f" }), args.id, "Animation"))
@@ -1079,7 +1403,9 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       "'name: description' separated by semicolons names each clip (e.g. 'attack-2: an overhead slash; block: " +
       "raise the sword to guard'); for one image a plain 'idle, run, jump' also works. Several actions on several " +
       "images: every image gets every action.\n" +
-      "Cost: 15 credits per clip (mirrored clips are free; clips that fail are refunded). Clips that come back to " +
+      "Cost: 15 credits per clip, 25 per clip of a 1024 HD image (drawn at 1080P), 30 per looping walk/run clip " +
+      "(walk, stroll, march, sneak, tiptoe, patrol, run, jog, sprint, dash, a charge forward) of a 1024 HD image; mirrored clips are free and " +
+      "clips that fail are refunded. Clips that come back to " +
       "their start (idle, walk, run, attack, jump, hurt, dash) end on their own first frame, so they loop; one-off " +
       "clips such as a death do not. Clips are added to their source asset as frames named after the action.",
     {
@@ -1092,6 +1418,9 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
       holdFacing: z.boolean().default(false).describe("End every clip on the frame it started from, even one-off clips such as a death (by default loops end on their start and one-offs don't)"),
       flipFacings: z.boolean().default(true).describe("On an 8-way rotation set, mirror the left-side clips from the right-side ones instead of animating them (mirrored clips are free). One-sided details swap sides, as on the rotation images"),
       autoFlip: z.boolean().default(false).describe("After the run, mirror every right-side clip on the asset that has no left twin (animate only the right-facing turns, get all eight). Free"),
+      room: room.describe("Room for big moves, decided once per sprite for the whole set so it is one size in every clip. " +
+        "auto: if any clip is a big move (kick, special, fall, jump) and the character fills its frame, every clip of " +
+        "that sprite draws it a little smaller. on: always. off: never"),
     },
     writeTool("Generate animation set"),
     tool(async (args) => resultsContent(await apiPost("/generate/multi-animation", args), "Animation set generated."))
@@ -1105,6 +1434,80 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     { id: assetId },
     writeTool("Flip to left side"),
     tool(async ({ id }) => framesResult(await apiPost("/generate/flip", { id }), id, "Flip"))
+  );
+
+  server.tool(
+    "resize_sprite",
+    `Free. Only for images generated in Voidless (not uploads): pixel sprites of size ${PIXEL_SIZE_TEXT}, or HD ` +
+      "(non-pixel, square 512/1024) images. Re-runs Voidless's pixel pass at a new size from the " +
+      "art it stored, so the base image, its rotations, edits and every animation come out at the new size on one " +
+      "palette and the character keeps its design (unlike generating it again smaller). On an HD image it makes a " +
+      "pixel version at `size`: generate HD, then resize to 64 and to 32 for pixel versions. Makes a NEW asset; the " +
+      "original is untouched.",
+    {
+      id: assetId,
+      size: sizeSchema(...PIXEL_SIZES).optional()
+        .describe(`New size in px: ${PIXEL_SIZE_TEXT}. Omit to keep the size (required for an HD image)`),
+    },
+    writeTool("Resize sprite"),
+    tool(async ({ id, size }) => {
+      const data = await apiPost("/generate/resize", { assetId: id, size });
+      const asset = data.asset || {};
+      const md = asset.meta_data || {};
+      const link = `${APP_URL}/asset/${asset.id}`;
+      const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+      const lines = [
+        `Resized asset ${id} into a new asset: ${md.size} px, ${md.colours} colours. The original is unchanged. Free.`,
+        `Asset ID: ${asset.id} · ${link}`,
+        Array.isArray(data.palette) && data.palette.length ? `Palette: ${data.palette.join(" ")}` : null,
+        skipped.length ? `${skipped.length} frame set(s) were left out: ` +
+          skipped.map((x) => (x && typeof x === "object" ? `${x.name || `frame ${x.id}`} (${x.reason || "no stored renders"})` : `frame ${x}`)).join("; ") +
+          "." : null,
+      ].filter(Boolean);
+      const content = [{ type: "text", text: lines.join("\n") }];
+      const frames = (md.frames || []).filter((f) => !f.archived);
+      if (frames.length) content.push({ type: "text", text: "Frames:\n" + frames.map(frameLine).join("\n") });
+      const image = await inlineImage(asset.file);
+      if (image) content.push(image);
+      const items = [mediaItem(asset.file, "Resized", { link }), ...frames.flatMap((f) => frameItems(f, asset.id))];
+      return withGallery({ content }, items, "Resized");
+    })
+  );
+
+  server.tool(
+    "match_palette",
+    `Free. Only for images generated in Voidless (not uploads): pixel sprites of size ${PIXEL_SIZE_TEXT} (an HD ` +
+      "image: resize_sprite it to a pixel size first). Puts 1-12 sprites on ONE shared palette so separately generated assets look like one scene. The palette is " +
+      "built from all of them as colour ramps, or given as hex colours, or led by one sprite's own colours; every " +
+      "frame of every sprite is remapped along the ramps so shading stays smooth. Each sprite gets a NEW asset " +
+      "(originals untouched).",
+    {
+      ids: z.array(z.number().int()).min(1).max(12).describe("The image assets to put on one palette (1-12)"),
+      colours: z.number().int().min(8).max(64).optional()
+        .describe("Size of the SHARED palette all of them draw from (8-64, default 24). Each sprite keeps roughly its own colour count"),
+      palette: z.array(z.string().regex(/^#?[0-9a-fA-F]{6}$/)).min(1).max(64).optional()
+        .describe("Use this palette instead, as hex colours like \"#1a2b3c\""),
+      lead: z.number().int().optional().describe("One of ids whose own colours are kept exactly; the others follow it"),
+    },
+    writeTool("Match palette"),
+    tool(async ({ ids, colours, palette, lead }) => {
+      const data = await apiPost("/generate/match-palette", { assetIds: ids, colours, palette, leadAssetId: lead });
+      const assets = Array.isArray(data.assets) ? data.assets : [];
+      const shared = Array.isArray(data.palette) ? data.palette : [];
+      const lines = [
+        `Matched ${assets.length} sprite${assets.length === 1 ? "" : "s"} on one ${shared.length}-colour palette. Originals unchanged. Free.`,
+        ...assets.map((a) => `Asset ${a.meta_data?.derived_from?.assetId} -> new asset ${a.id} · ${APP_URL}/asset/${a.id}`),
+        `Palette: ${shared.join(" ")}`,
+        Array.isArray(data.skipped) && data.skipped.length ? `Not matched: ${data.skipped.join(", ")}` : null,
+      ].filter(Boolean);
+      const content = [{ type: "text", text: lines.join("\n") }];
+      for (const a of assets.slice(0, MAX_INLINE_IMAGES)) {
+        const image = await inlineImage(a.file);
+        if (image) content.push(image);
+      }
+      const items = assets.map((a) => mediaItem(a.file, `#${a.id}`, { link: `${APP_URL}/asset/${a.id}` }));
+      return withGallery({ content }, items, "Palette matched");
+    })
   );
 
   // ---------------------------------------------------------------------------

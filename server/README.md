@@ -88,22 +88,26 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 
 | Tool | What it does |
 | --- | --- |
-| `generate_image` | Sprite, character, portrait, prop, tileset, UI piece or artwork in a chosen model, style, palette, size and perspective; artwork can be 16:9 for backdrops |
+| `generate_image` | Sprite, character, portrait, prop, tileset, UI piece or artwork in a chosen model, style, palette, size and perspective; artwork can be 16:9 for backdrops. Always drawn in one of Voidless's style presets: with no `style`, one the prompt names ("a watercolour frost mage") is used, else pixel art below 512 and cartoon above; the result says which |
 | `edit_image` | Change an image with an instruction; the edit is added as a new frame |
 | `make_normal_map` | A normal map for an image, an edit or every frame of an animation, for 2D lights in a game engine; free |
 | `make_glow_map` | The light an edit added (lit windows, a night version's lamps) on its own, for an additive glow layer; free |
-| `rotate_sprite` | An 8-way set (front, back, sides, diagonals) in one pass |
-| `extract_parts` | Split a character into body parts for rigging |
-| `upload_image` | Add an image you already have to your library |
+| `rotate_sprite` | An 8-way set (front, back, sides, diagonals) in one pass (20 credits) |
+| `extract_parts` | Cut a sheet of items into one new generated asset per item (default), at its own proportions, framed like a generated sprite, ready for rotate/animate/resize; or with `save_as: "frames"` split a character into body parts for rigging (layer frames) |
+| `generate_asset_set` | A whole matching art set in one camera view (platformer, top-down, overhead, isometric…): characters, props and tiles drawn on 2048 px sheets, cut into one asset per item, each tagged with its view and facing so the rotate and animation tools use the right angle. 20 credits a sheet + 10 a cut; `estimate_only` shows the plan and price first |
+| `add_to_asset_set` | Add items to a set in the same view, style and palette, or redraw just the pieces that failed their view check (`redraw_failed`). Same price |
+| `upload_image` | Add an image you already have to your library, from a public `url` or as base64 |
 | `pixelate_image` | Convert any image to pixel art (32 to 1024 px) |
 | `clean_up_sprite` | Make a sprite or a 1-5 s animation from anywhere game-ready: background removed, pixel art on a real grid, stray pixels fixed; videos come back as 16 frames |
+| `resize_sprite` | Re-pixel a sprite generated in Voidless at any pixel size (32, 48, 64, 96, 128, 192, 256, 384 px), or make a pixel version of an HD image generated in Voidless, with its rotations and animations, as a new asset; free |
+| `match_palette` | Put 1-12 sprites generated in Voidless on one shared palette (ramps built from them, your hex list, or one sprite's colours), one new asset each; free |
 
 **Animation**
 
 | Tool | What it does |
 | --- | --- |
-| `animate_sprite` | One 16-frame clip from a description of the motion |
-| `generate_animation_set` | Several clips in one job, 15 credits each: a preset (platformer, top-down walk/run/dash/attack/idle) on one or more sprites, one directional clip per facing of an 8-way set (the left side mirrored from the right for free; `autoFlip` mirrors any right-only clips after the run), or your own list of actions. Loops end on their first frame |
+| `animate_sprite` | One 16-frame clip from a description of the motion. Big moves on a character that fills its frame get room (`room`: `auto`, `on`, `off`) |
+| `generate_animation_set` | Several clips in one job, 15 credits each: a preset (platformer, top-down walk/run/dash/attack/idle) on one or more sprites, one directional clip per facing of an 8-way set (the left side mirrored from the right for free; `autoFlip` mirrors any right-only clips after the run), or your own list of actions. Loops end on their first frame. `room` (`auto`, `on`, `off`) is decided once per sprite, so it stays one size in every clip |
 | `get_image_data` | An image, or an animation as one sprite strip, as a small data URI to paste into HTML (for sandboxes such as Claude's HTML artifacts that cannot load outside images), with a CSS snippet to play it |
 | `flip_left_side` | Mirror the right-side animations into the left side (walk-right -> walk-left), free |
 
@@ -120,7 +124,7 @@ Or just the hosted connector, no key: `claude mcp add --transport http voidless 
 
 The same tools as [voidless.dev/tools](https://voidless.dev/tools), for any image, not just your library. Inputs are image URLs (a `cdn.voidless.dev` link from `get_asset` or a saved result works), image keys from your library (`assets/…png`, as `get_asset` lists them), or base64/data URIs, PNG or GIF, up to 2048x2048, 256 frames and 32 MB per call. Results come back in the chat: images as PNG/GIF, the `.tres` and atlas `.json` as text.
 
-Results can also be saved to your library (free, private, counts toward your storage), which gives them an asset id and `cdn.voidless.dev` URLs to pass to the next tool instead of base64 (for example `generate_vfx` → `palette_swap` → `add_outline` → `animate_sprite`). `generate_vfx` saves its effect by default (with its recipe, so it can be rendered again; `save: false` skips it); `palette_swap`, `add_outline`, `pack_sprite_sheet`, `slice_sprite_sheet` and `make_gif` save only when you pass `save: true`. They run on Voidless's server: the hosted connector serves them, and the npm package forwards them there with your key (so they need a connection).
+Results can also be saved to your library (free, private, counts toward your storage), which gives them an asset id and `cdn.voidless.dev` URLs to pass to the next tool instead of base64 (for example `generate_vfx` → `palette_swap` → `add_outline` → `animate_sprite`). `generate_vfx` saves its effect by default (with its recipe, so it can be rendered again; `save: false` skips it); `palette_swap`, `add_outline`, `sprite_death`, `day_night_palettes`, `liquid_tiles`, `parallax_background`, `wind_sway`, `secondary_motion`, `generate_items`, `pack_sprite_sheet`, `slice_sprite_sheet` and `make_gif` save only when you pass `save: true`. They run on Voidless's server: the hosted connector serves them, and the npm package forwards them there with your key (so they need a connection).
 
 | Tool | What it does |
 | --- | --- |
@@ -130,6 +134,13 @@ Results can also be saved to your library (free, private, counts toward your sto
 | `make_gif` | Frames or a sheet to an animated GIF: fps, loop, nearest-neighbour scale, transparency kept |
 | `palette_swap` | Swap colours (exact from→to pairs, or nearest), or quantize to a preset/custom palette with dithering; lists an image's colours |
 | `add_outline` | Outline a transparent sprite: colour, thickness, outside or inside, 4- or 8-connected |
+| `sprite_death` | A death or despawn animation from any sprite: dissolve, burn, burst, disintegrate or blink, in the sprite's own colours; GIF plus sheet |
+| `day_night_palettes` | A sprite, tile or scene at dawn, day, dusk and night, each colour mapped to one new colour (palette swap JSON), plus an optional day-cycle GIF |
+| `liquid_tiles` | A seamless, looping animated tile: ocean, river, pond, lava, acid or waterfall (with its foaming base); tile GIF, 4x4 GIF and sheet |
+| `parallax_background` | A layered pixel-art side-scroller background from a preset (sky, mountains, city, trees…): every layer tiles, one PNG per layer, the composed image, Godot speeds, optional scrolling GIF |
+| `wind_sway` | A tree, bush or grass sprite swaying in the wind as a seamless loop, in its own colours; optional one-shot leaf storm; GIF plus sheet |
+| `secondary_motion` | A sprite's cape, hair or tail (given as its colours) sways in a looping breeze, or trails a walk cycle's movement; GIF plus sheet |
+| `generate_items` | Procedural pixel-art RPG item icons from a seed (swords, axes, bows, shields, potions, gems, keys, chests or mixed loot), each named, with rarity trims; sheet plus JSON atlas |
 
 Generation tools create new content in your library; none deletes or overwrites existing assets. Each tool's description lists its credit cost.
 
