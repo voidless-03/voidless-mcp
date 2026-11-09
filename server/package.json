@@ -4,7 +4,7 @@
   "version": "1.8.3",
   "description": "MCP server for Voidless: game sprites, animations, tilesets, sound, music, video and 3D models, plus free sprite-sheet tools",
   "license": "MIT",
-  "author": "Voidless Dev Inc. <contact@voidless.dev>",
+  "author": "Hyphen Holdings Inc. <contact@voidless.dev>",
   "type": "module",
   "bin": {
     "voidless-mcp": "./index.js"
