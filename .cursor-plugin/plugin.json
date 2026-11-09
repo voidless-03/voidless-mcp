@@ -1,0 +1,13 @@
+{
+  "name": "voidless",
+  "description": "Game sprites, 8-way turns, animation sets, tilesets, sound effects, music and 3D models from Cursor, saved to your Voidless library, plus free sprite-sheet, GIF and Godot SpriteFrames tools.",
+  "version": "1.8.3",
+  "author": { "name": "Voidless Dev Inc.", "email": "contact@voidless.dev" },
+  "homepage": "https://voidless.dev/mcp",
+  "repository": "https://github.com/voidless-03/voidless-mcp",
+  "license": "MIT",
+  "keywords": ["gamedev", "sprites", "pixel-art", "animation", "tileset", "godot", "sound-effects", "music", "3d"],
+  "logo": "docs/icon.png",
+  "mcpServers": "mcp.json",
+  "skills": "skills"
+}
