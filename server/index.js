@@ -24,9 +24,10 @@ import { z } from "zod";
 import { createVoidlessServer, VERSION } from "./tools.js";
 
 const API_KEY = process.env.VOIDLESS_API_KEY || "";
+// Without a key the server still starts and lists its tools (so directories and inspectors such as
+// Glama can index it); each call then fails with the API's authentication error.
 if (!API_KEY) {
-  console.error("[voidless-mcp] VOIDLESS_API_KEY is not set (expected a void_... key)");
-  process.exit(1);
+  console.error("[voidless-mcp] VOIDLESS_API_KEY is not set (expected a void_... key): tools are listed, but calls will fail until it is set");
 }
 const REMOTE_URL = process.env.VOIDLESS_MCP_URL || "https://mcp.voidless.dev/mcp";
 
