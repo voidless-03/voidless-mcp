@@ -266,7 +266,9 @@ export function animationPlanText(plan) {
   ].join("\n");
 }
 
-export function createVoidlessServer(API_KEY, transport = "stdio") {
+// `fetchFile` loads a stored file's URL (inlineImage, fetchPng). A stored value can be a full URL, so the
+// hosted server passes a fetch that only reaches public addresses (free/netguard.js publicFetch).
+export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile = fetch } = {}) {
   const CLIENT = `mcp/${VERSION} (${transport})`;
   async function api(method, path, body, headers = {}) {
     const res = await fetch(`${BASE_URL}/api${path}`, {
@@ -385,7 +387,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
     const url = cdnUrl(key);
     if (!url || !mimeFromPath(url).startsWith("image/")) return null;
     try {
-      const res = await fetch(url);
+      const res = await fetchFile(url);
       if (!res.ok) return null;
       const data = Buffer.from(await res.arrayBuffer()).toString("base64");
       return { type: "image", data, mimeType: mimeFromPath(url) };
@@ -721,7 +723,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio") {
   async function fetchPng(key) {
     const url = cdnUrl(key);
     if (!url) throw new Error(`No public file for ${key}.`);
-    const res = await fetch(url);
+    const res = await fetchFile(url);
     if (!res.ok) throw new Error(`Could not load ${url} (${res.status}).`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.slice(1, 4).toString() !== "PNG") throw new Error(`${url} is not a PNG; use the URL instead.`);
