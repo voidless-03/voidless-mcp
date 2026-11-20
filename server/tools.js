@@ -266,6 +266,18 @@ export function animationPlanText(plan) {
   ].join("\n");
 }
 
+// What a failed call says when the server's answer carried no message of its own (not JSON, or no
+// message in it). The status stays in the "Voidless API error (502)" prefix, which CUT_OFF reads.
+export function plainHttpError(status) {
+  if (status === 401) return "The Voidless API key was not accepted.";
+  if (status === 403) return "This account cannot do that.";
+  if (status === 404) return "Not found.";
+  if (status === 429) return "Too many requests at once. Try again in a minute.";
+  if (status === 502 || status === 503 || status === 504) return "Voidless did not answer in time. Try again in a minute.";
+  if (status >= 500) return "Something went wrong on the Voidless server. Try again in a minute.";
+  return "The request was refused.";
+}
+
 // `fetchFile` loads a stored file's URL (inlineImage, fetchPng). A stored value can be a full URL, so the
 // hosted server passes a fetch that only reaches public addresses (free/netguard.js publicFetch).
 export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile = fetch } = {}) {
@@ -286,7 +298,12 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
     }
 
     if (!res.ok) {
-      const msg = data?.error?.message || data?.message || data?.raw || `HTTP ${res.status}`;
+      // A body that is not JSON (a proxy's HTML 502 page, a bare stack trace) is never passed on.
+      let msg = data?.error?.message || data?.message || plainHttpError(res.status);
+      if (res.status === 429) {
+        const wait = Number(res.headers?.get?.("retry-after"));
+        if (Number.isFinite(wait) && wait > 0 && !/try again in/i.test(msg)) msg += ` Try again in ${Math.ceil(wait)} seconds.`;
+      }
       throw new Error(`Voidless API error (${res.status}): ${msg}`);
     }
     return data;
