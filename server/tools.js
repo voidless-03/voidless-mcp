@@ -115,6 +115,32 @@ export function worldText(meta = {}, frames = []) {
   return bits.join("\n");
 }
 
+/**
+ * get_asset's line for a rigged 3D model: each animation as `id · name · preset`, the id being what
+ * render_3d_sprites (animation) and animate_3d_model (from_animation) take.
+ */
+export function modelAnimationsText(animations) {
+  const list = (Array.isArray(animations) ? animations : []).filter((a) => a && typeof a === "object");
+  if (!list.length) return "Rigged: yes, no animations yet (animate_3d_model adds them).";
+  return `Rigged: yes, ${list.length} animation${list.length === 1 ? "" : "s"} (id · name · preset):\n` +
+    list.map((a) => `  - ${a.id} · ${a.name || "(unnamed)"} · ` +
+      `${a.preset || (a.from_id ? `copied from model ${a.from_id}` : "described move")}`).join("\n");
+}
+
+const TILESET_GRIDS = {
+  platformer: "a 3x3 sheet: the ground's top, middle and bottom rows with their left and right ends",
+  wang: "a 4x5 sheet of 20 tiles: the four-corner (wang) set of two terrains, any arrangement tiles seamlessly",
+  blob17: "a 5x5 sheet holding 17 pieces of one terrain on transparent (the top row is empty)",
+};
+
+/** A tileset's layout line ({ kind, tile } as the image API reports it), or null when it is not a tileset. */
+export function tilesetText(tileset) {
+  if (!tileset || typeof tileset !== "object" || !tileset.kind) return null;
+  const grid = TILESET_GRIDS[tileset.kind];
+  return `Tileset: ${tileset.kind}${grid ? `, ${grid}` : ""}${Number(tileset.tile) > 0 ? `; tiles are ${tileset.tile} px` : ""}. ` +
+    "Slice it on that grid.";
+}
+
 // The pixel-art sizes, as everywhere else in Voidless (strapi helpers/pixel PIXEL_SIZES). 48, 96, 192
 // and 384 sit between the classic 32/64/128/256.
 export const PIXEL_SIZES = [32, 48, 64, 96, 128, 192, 256, 384];
@@ -172,6 +198,22 @@ export const freeOptions = z
       "a vehicle its type (cart, car, pickup, truck, tank, train-engine, rowboat, galleon, pirate-ship, plane, helicopter, space-fighter, flying-carpet...), color, color2, material, condition (new, rusty, damaged, burning), marking (police, medic, military, pirate, royal, racing, taxi, fire), cargo, lights, view (topdown, side or top), dirs (8, 4 or 1), size (32 to 128: a step of a third from the type's own size around its true length) and animations (still, idle, move, destroyed)."
   );
 
+// The video model's two shapes, as the app's video generator and editor offer them (the video route
+// refuses others).
+export const VIDEO_SIZES = { "16:9": { width: 864, height: 496 }, "9:16": { width: 496, height: 864 } };
+const videoAspect = z.enum(["16:9", "9:16"]).default("16:9")
+  .describe("The clip's shape: '16:9' landscape (864x496, default) or '9:16' portrait (496x864)");
+
+/**
+ * extend_video's reference images: the video's own, as the app's editor sends them: the references set in the
+ * editor, else the images the video was generated from. Strings only, up to 7.
+ */
+export function videoReferences(meta = {}) {
+  const pick = (list) => (Array.isArray(list) ? list.filter((r) => typeof r === "string" && r.trim()) : []);
+  const editor = pick(meta && meta.editor_references);
+  return (editor.length ? editor : pick(meta && meta.ref_images)).slice(0, 7);
+}
+
 /** A size field that takes exactly these values (numbers, plus any string literal such as "4k"). */
 export function sizeSchema(...sizes) {
   return z.union(sizes.map((s) => z.literal(s)));
@@ -194,6 +236,83 @@ const APP_URL = (
 // and most clients show only its first frame anyway. The GIF stays in the text as a link. Capped so a
 // call that returns a whole set does not flood the context; 8 covers one 8-direction set.
 const MAX_INLINE_IMAGES = 8;
+// Inline previews are shrunk to this longest side (a 1024 artwork was ~1.5 MB as base64, one result could
+// carry eight), and one reply's previews together stay under INLINE_BUDGET characters of base64; the rest
+// are left to the links and the gallery, which show them at full size.
+export const INLINE_MAX_SIDE = 256;
+export const INLINE_BUDGET = 300_000;
+// The budget left in the reply being built (one per tool call, set by tool()).
+const inlineBudget = new AsyncLocalStorage();
+
+/** Box-average downscale of decoded RGBA ({ width, height, data }); keeps edges clean on smooth art. */
+export function shrink(img, w, h) {
+  if (img.width === w && img.height === h) return img;
+  const out = Buffer.alloc(w * h * 4);
+  const sx = img.width / w, sy = img.height / h;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.floor(y * sy), y1 = Math.max(y0 + 1, Math.floor((y + 1) * sy));
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.floor(x * sx), x1 = Math.max(x0 + 1, Math.floor((x + 1) * sx));
+      let r = 0, g = 0, b = 0, a = 0, n = 0;
+      for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
+        const i = (yy * img.width + xx) * 4, al = img.data[i + 3];
+        r += img.data[i] * al; g += img.data[i + 1] * al; b += img.data[i + 2] * al; a += al; n++;
+      }
+      const o = (y * w + x) * 4;
+      if (a) { out[o] = r / a; out[o + 1] = g / a; out[o + 2] = b / a; }
+      out[o + 3] = a / n;
+    }
+  }
+  return { width: w, height: h, data: out };
+}
+
+/** Nearest-neighbour downscale: pixel art stays crisp, with no blended colours. */
+function nearest(img, w, h) {
+  const out = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(img.height - 1, Math.floor((y + 0.5) * img.height / h));
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(img.width - 1, Math.floor((x + 0.5) * img.width / w));
+      img.data.copy(out, (y * w + x) * 4, (sy * img.width + sx) * 4, (sy * img.width + sx) * 4 + 4);
+    }
+  }
+  return { width: w, height: h, data: out };
+}
+
+/** Pixel art has few colours (Voidless caps them at 64); a smooth render has thousands. */
+function looksPixel(img, limit = 96) {
+  const seen = new Set();
+  const step = Math.max(1, Math.floor((img.width * img.height) / 65536));
+  for (let p = 0; p < img.width * img.height; p += step) {
+    const i = p * 4;
+    if (img.data[i + 3] < 128) continue;
+    seen.add((img.data[i] << 16) | (img.data[i + 1] << 8) | img.data[i + 2]);
+    if (seen.size > limit) return false;
+  }
+  return true;
+}
+
+/**
+ * A PNG as an inline preview: unchanged when its longest side is `maxSide` or less, else shrunk to it
+ * (nearest-neighbour for pixel art, box-averaged otherwise). Anything that is not a readable PNG comes
+ * back as it was.
+ */
+export function previewPng(buf, maxSide = INLINE_MAX_SIDE) {
+  let img;
+  try {
+    img = PNG.sync.read(buf);
+  } catch {
+    return buf;
+  }
+  const side = Math.max(img.width, img.height);
+  if (side <= maxSide) return buf;
+  const w = Math.max(1, Math.round(img.width * maxSide / side));
+  const h = Math.max(1, Math.round(img.height * maxSide / side));
+  const small = looksPixel(img) ? nearest(img, w, h) : shrink(img, w, h);
+  const png = new PNG({ width: w, height: h });
+  small.data.copy(png.data);
+  return PNG.sync.write(png, { colorType: 6 });
+}
 
 const GALLERY_URI = "ui://voidless/gallery.html";
 const GALLERY_MIME = "text/html;profile=mcp-app";
@@ -202,7 +321,7 @@ const GALLERY_TOOLS = [
   "flip_left_side", "generate_video", "generate_sfx", "generate_music", "generate_3d_model", "get_asset",
   "list_assets", "extract_parts", "pixelate_image", "extend_video", "clean_up_sprite", "check_generation",
   "render_3d_sprites", "upload_3d_model", "resize_sprite", "match_palette", "generate_asset_set", "add_to_asset_set",
-  "reprocess_animation",
+  "reprocess_animation", "list_styles",
 ];
 const GALLERY_HTML = readFileSync(new URL("./gallery.html", import.meta.url), "utf8");
 
@@ -252,6 +371,24 @@ function restoredText(result) {
   ].filter(Boolean).join("\n");
 }
 
+/**
+ * A long call's job key (X-Idempotency-Key): `mcp-<route>.<asset id>-<uuid>`, e.g.
+ * "mcp-image-animation.123-…". The route and the asset the call was about are all check_generation needs
+ * to format the stored result as the tool would have; Strapi takes [A-Za-z0-9_.:-], 8-100 characters.
+ */
+export function jobKey(path, body = {}) {
+  const route = String(path || "").replace(/^\/generate\//, "").replace(/[^a-z0-9-]/gi, "-").slice(0, 30);
+  const raw = body && (body.id ?? body.assetId);
+  const id = Number.isInteger(raw) && raw > 0 ? raw : 0;
+  return `mcp-${route}.${id}-${randomUUID()}`;
+}
+
+/** { path, id } from a jobKey, or null for any other key (older releases sent `mcp-<uuid>`). */
+export function parseJobKey(key) {
+  const m = /^mcp-([a-z0-9-]+)\.(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(String(key || ""));
+  return m ? { path: `/generate/${m[1]}`, id: Number(m[2]) || null } : null;
+}
+
 // `transport` is "stdio" (index.js) or "hosted" (http.js). Every API call says it comes from the MCP
 // server, so Voidless can tell these generations from the web app's and from direct API use.
 // generate_animation_set without expectedCost: the plan Strapi answered (planOnly), to show before anything
@@ -264,6 +401,26 @@ export function animationPlanText(plan) {
     "Show this to the user. To make it, call generate_animation_set again with the same arguments and " +
       `expectedCost: ${plan?.cost}.`,
   ].join("\n");
+}
+
+/**
+ * get_animation_presets' price line, from what the server says it runs now (the presets endpoint's
+ * `engine`): per clip (every clip its own call, the default), or per pass when one call draws up to
+ * `passCells` clips of an action together. The tool texts point here rather than repeat a price.
+ */
+export function animationPriceText(data = {}) {
+  const n = (v, d) => (Number(v) > 0 ? Number(v) : d);
+  const perClip = n(data.pricePerClip, 15);
+  const perHdClip = n(data.pricePerHdClip, 25);
+  const perHdRunClip = n(data.pricePerHdRunClip, 30);
+  const clips = `${perClip} credits per clip, ${perHdClip} for a 1024 HD image (drawn at 1080P), ${perHdRunClip} for a ` +
+    "looping walk/run on a 1024 HD image (a 2 s clip)";
+  const price = data.engine === "omni" && Number(data.pricePerPass) > 0
+    ? `${data.pricePerPass} credits per pass: one pass draws up to ${n(data.passCells, 6)} clips of one action together ` +
+      `(the facings of a character, or several sprites); an action with a single clip is one clip at ${clips}`
+    : clips;
+  return `Price: ${price}. Mirrored left-side clips are free and failed clips are refunded. ` +
+    `generate_animation_set shows the exact total before charging. Up to ${n(data.maxImages, 12)} images per run.`;
 }
 
 // What a failed call says when the server's answer carried no message of its own (not JSON, or no
@@ -280,7 +437,7 @@ export function plainHttpError(status) {
 
 // `fetchFile` loads a stored file's URL (inlineImage, fetchPng). A stored value can be a full URL, so the
 // hosted server passes a fetch that only reaches public addresses (free/netguard.js publicFetch).
-export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile = fetch } = {}) {
+export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile = (...args) => fetch(...args) } = {}) {
   const CLIENT = `mcp/${VERSION} (${transport})`;
   async function api(method, path, body, headers = {}) {
     const res = await fetch(`${BASE_URL}/api${path}`, {
@@ -312,16 +469,12 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
   const apiGet = (path) => api("GET", path);
   const apiPut = (path, body) => api("PUT", path, body);
 
-  // check_generation re-runs the tool that started a job with its stored result standing in for the
-  // slow call, so the reply is exactly what the tool would have returned (see LONG_PATHS).
-  const replay = new AsyncLocalStorage();
-  const pending = new Map(); // job key -> { handler, args, path }
-
   async function apiPost(path, body) {
-    const stored = replay.getStore();
-    if (stored && stored.path === path) return stored.result;
     if (!LONG_PATHS.has(path)) return api("POST", path, body);
-    const key = `mcp-${randomUUID()}`;
+    // The key names the route and the asset, so check_generation can format the stored result like the
+    // tool would have from nothing but the key: the hosted server is a new server per request, and a
+    // local one may have restarted, so nothing about the call is kept in memory (jobKey / parseJobKey).
+    const key = jobKey(path, body);
     const call = api("POST", path, body, { "X-Idempotency-Key": key }).then((v) => ({ v }), (e) => ({ e }));
     let timer;
     const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), WAIT_MS); });
@@ -354,19 +507,21 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
 
   // Tool errors go back to the model as text it can act on, not as a protocol failure.
   function tool(handler) {
-    return async (args) => {
+    return async (args) => inlineBudget.run({ left: INLINE_BUDGET, skipped: 0 }, async () => {
       try {
-        return await handler(args);
-      } catch (err) {
-        if (err instanceof PendingJob) {
-          pending.set(err.key, { handler, args, path: err.path });
-          if (pending.size > 500) pending.delete(pending.keys().next().value);
-          return pendingResult(err.key);
+        const out = await handler(args);
+        const budget = inlineBudget.getStore();
+        if (budget.skipped && out && Array.isArray(out.content)) {
+          out.content.push({ type: "text", text: `${budget.skipped} more preview${budget.skipped === 1 ? " was" : "s were"} ` +
+            "left out to keep this reply small: the links above (and the gallery) show every image at full size." });
         }
+        return out;
+      } catch (err) {
+        if (err instanceof PendingJob) return pendingResult(err.key);
         if (err instanceof RestoredJob) return { content: [{ type: "text", text: restoredText(err.result) }] };
         return { isError: true, content: [{ type: "text", text: String(err.message || err) }] };
       }
-    };
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -400,17 +555,45 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
     return frame.type === "animation" ? images[Math.floor(images.length / 2)] : images[0];
   }
 
+  // A preview of a stored image for the reply: a PNG shrunk to INLINE_MAX_SIDE, within the reply's budget
+  // (INLINE_BUDGET); null when it can't be loaded or the budget is spent (tool() then says so).
   async function inlineImage(key) {
     const url = cdnUrl(key);
     if (!url || !mimeFromPath(url).startsWith("image/")) return null;
+    const budget = inlineBudget.getStore();
+    if (budget && budget.left <= 0) {
+      budget.skipped++;
+      return null;
+    }
     try {
       const res = await fetchFile(url);
       if (!res.ok) return null;
-      const data = Buffer.from(await res.arrayBuffer()).toString("base64");
-      return { type: "image", data, mimeType: mimeFromPath(url) };
+      let buf = Buffer.from(await res.arrayBuffer());
+      const isPng = buf.slice(1, 4).toString() === "PNG";
+      if (isPng) buf = previewPng(buf);
+      const data = buf.toString("base64");
+      if (budget) {
+        // The first preview is always shown, whatever its size; later ones only while they fit.
+        if (data.length > budget.left && budget.left < INLINE_BUDGET) {
+          budget.skipped++;
+          return null;
+        }
+        budget.left -= data.length;
+      }
+      return { type: "image", data, mimeType: isPng ? "image/png" : mimeFromPath(url) };
     } catch {
       return null;
     }
+  }
+
+  /** Previews of up to MAX_INLINE_IMAGES stored images, in order, skipping what can't be shown. */
+  async function inlineImages(keys) {
+    const out = [];
+    for (const key of (keys || []).slice(0, MAX_INLINE_IMAGES)) {
+      const image = await inlineImage(key);
+      if (image) out.push(image);
+    }
+    return out;
   }
 
   function money(data) {
@@ -561,6 +744,169 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
   }
 
   // ---------------------------------------------------------------------------
+  // Replies of the long calls, by route: what the tool returns, and what check_generation returns for a
+  // job that was still running, from the route and asset id in its key (parseJobKey) and the result the
+  // server stored. Nothing else about the call is needed, so a new server (the hosted connector makes
+  // one per request) or a restarted one formats it the same.
+  // ---------------------------------------------------------------------------
+  async function imageResult(data) {
+    const out = await assetResult(data, "Image", [styleLine(data), tilesetText(data.tileset)]);
+    // The layout as data too, for a client that slices the sheet itself.
+    if (data.tileset && data.tileset.kind) out.structuredContent.tileset = { kind: data.tileset.kind, tile: data.tileset.tile };
+    return out;
+  }
+
+  async function partsResult(data, id) {
+    if (Array.isArray(data.assets)) {
+      const assets = data.assets;
+      const lines = [
+        `Saved ${assets.length} item${assets.length === 1 ? "" : "s"}${id ? ` from asset ${id}` : ""} as new assets:`,
+        ...assets.map((a) => `#${a.id} ${a.prompt} (${a.image_type}) · ${APP_URL}/asset/${a.id}`),
+        money(data),
+      ].filter(Boolean);
+      const content = [{ type: "text", text: lines.join("\n") }];
+      content.push(...(await inlineImages(assets.map((a) => a.file))));
+      const items = assets.map((a) => mediaItem(a.file, `#${a.id} ${a.prompt || ""}`.trim(), { link: `${APP_URL}/asset/${a.id}` }));
+      return withGallery({ content }, items, "Items");
+    }
+    // The ids returned here are off by (parts - 1): the server numbers from the last appended
+    // frame. Point at get_asset instead of printing ids that would misdirect a follow-up call.
+    const names = (data.frames || []).map((f) => f.name).filter(Boolean);
+    return withGallery({
+      content: [
+        {
+          type: "text",
+          text: `Extracted ${names.length} parts from asset ${id}: ${names.join(", ")}.\n${money(data)}\nUse get_asset ${id} for their frame ids and image keys.`,
+        },
+      ],
+    }, (data.frames || []).flatMap((f) => frameItems(f, id)), "Parts");
+  }
+
+  function extendResult(data, id) {
+    const clips = (data.videos || []).map((v) => `- ${cdnUrl(v.file)}`).join("\n");
+    const link = `${APP_URL}/asset/${id}`;
+    return withGallery(
+      { content: [{ type: "text", text: `Extended video ${id}:\n${clips}\n${money(data)}` }] },
+      (data.videos || []).map((v, i) => mediaItem(v.file, `Extension ${i + 1}`, { link })),
+      "Video extended"
+    );
+  }
+
+  function rigResult(data, id) {
+    return { content: [{ type: "text", text: `Rigged model ${id}: ${cdnUrl(data.rigged_glb || data.rigged_file)}\n${money(data)}` }] };
+  }
+
+  function modelAnimationResult(data, id, prompt) {
+    const anim = data.animation || {};
+    const name = anim.name || prompt || "animation";
+    return {
+      content: [{
+        type: "text",
+        text: [
+          `Animation "${name}"${anim.id != null ? ` (id ${anim.id})` : ""} on model ${id}: ${cdnUrl(anim.file)}`,
+          anim.id != null ? `render_3d_sprites takes it as animation "${anim.id}"; animate_3d_model from_animation ${anim.id} copies it to another model.` : null,
+          money(data),
+        ].filter(Boolean).join("\n"),
+      }],
+    };
+  }
+
+  async function spritesResult(data, id) {
+    const asset = await apiGet(`/assets/${data.assetId}`).catch(() => null);
+    const name = String(data.animation?.name || "still").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+    // This render's clips: marked as made from this model on the server (a re-render keeps their ids).
+    const all = ((asset?.meta_data?.frames) || []).map((f, i) => (f && f.id === undefined ? { ...f, id: i } : f));
+    const named = all.filter((f) => f && !f.archived && f.type === "animation" && String(f.name || "").startsWith(`${name}-`));
+    const marked = named.filter((f) => f.from_model && f.from_model.server && (!id || Number(f.from_model.id) === Number(id)));
+    const made = (marked.length ? marked : named).slice(-(data.directions || []).length || undefined);
+    const dirs = data.directions || [];
+    const head = [
+      `${data.animation ? `"${data.animation.name}"` : "The model standing"} rendered from 3D: ` +
+        `${dirs.length} direction${dirs.length === 1 ? "" : "s"} ` +
+        `(${dirs.join(", ")}), ${data.frameCount} frame${data.frameCount === 1 ? "" : "s"} each at ${data.size} px, ${data.fps} fps.`,
+      `${data.added ? "Added to" : "Saved as"} sprite asset ${data.assetId} (${APP_URL}/asset/${data.assetId})${id ? `, linked to model ${id}` : ""}.`,
+      data.replaced ? `Replaced the earlier render of this move (${data.replaced} frame set${data.replaced === 1 ? "" : "s"}, same ids).` : null,
+      money(data),
+    ].filter(Boolean).join("\n");
+    const content = [{ type: "text", text: head }];
+    if (made.length) content.push(...(await frameContent(made)));
+    return withGallery({ content }, made.flatMap((f) => frameItems(f, data.assetId)), "3D sprites");
+  }
+
+  async function resizeResult(data, id) {
+    const asset = data.asset || {};
+    const md = asset.meta_data || {};
+    const link = `${APP_URL}/asset/${asset.id}`;
+    const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+    const lines = [
+      `Resized asset ${id} into a new asset: ${md.size} px, ${md.colours} colours. The original is unchanged. Free.`,
+      `Asset ID: ${asset.id} · ${link}`,
+      Array.isArray(data.palette) && data.palette.length ? `Palette: ${data.palette.join(" ")}` : null,
+      skipped.length ? `${skipped.length} frame set(s) were left out: ` +
+        skipped.map((x) => (x && typeof x === "object" ? `${x.name || `frame ${x.id}`} (${x.reason || "no stored renders"})` : `frame ${x}`)).join("; ") +
+        "." : null,
+    ].filter(Boolean);
+    const content = [{ type: "text", text: lines.join("\n") }];
+    const frames = (md.frames || []).filter((f) => !f.archived);
+    if (frames.length) content.push({ type: "text", text: "Frames:\n" + frames.map(frameLine).join("\n") });
+    content.push(...(await inlineImages([asset.file])));
+    const items = [mediaItem(asset.file, "Resized", { link }), ...frames.flatMap((f) => frameItems(f, asset.id))];
+    return withGallery({ content }, items, "Resized");
+  }
+
+  async function matchResult(data) {
+    const assets = Array.isArray(data.assets) ? data.assets : [];
+    const shared = Array.isArray(data.palette) ? data.palette : [];
+    const lines = [
+      `Matched ${assets.length} sprite${assets.length === 1 ? "" : "s"} on one ${shared.length}-colour palette. Originals unchanged. Free.`,
+      ...assets.map((a) => `Asset ${a.meta_data?.derived_from?.assetId} -> new asset ${a.id} · ${APP_URL}/asset/${a.id}`),
+      `Palette: ${shared.join(" ")}`,
+      Array.isArray(data.skipped) && data.skipped.length ? `Not matched: ${data.skipped.join(", ")}` : null,
+    ].filter(Boolean);
+    const content = [{ type: "text", text: lines.join("\n") }];
+    content.push(...(await inlineImages(assets.map((a) => a.file))));
+    const items = assets.map((a) => mediaItem(a.file, `#${a.id}`, { link: `${APP_URL}/asset/${a.id}` }));
+    return withGallery({ content }, items, "Palette matched");
+  }
+
+  const FORMAT = {
+    "/generate/image": (d) => imageResult(d),
+    "/generate/image-edit": (d, id) => framesResult(d, id, "Edit"),
+    "/generate/bbox-edit": (d, id) => framesResult(d, id, "Edit"),
+    "/generate/image-rotations": (d, id) => framesResult(d, id, "8-way rotation"),
+    "/generate/image-parts": (d, id) => partsResult(d, id),
+    "/generate/image-animation": (d, id) => framesResult(d, id, "Animation"),
+    "/generate/multi-animation": (d) => resultsContent(d, "Animation set generated."),
+    "/generate/video": (d) => assetResult(d, "Video"),
+    "/generate/video-extend": (d, id) => extendResult(d, id),
+    "/generate/sfx": (d) => assetResult(d, "Sound effect"),
+    "/generate/music": (d) => assetResult(d, "Music"),
+    "/generate/3d-model": (d) => assetResult(d, "3D model"),
+    "/generate/model-rig": (d, id) => rigResult(d, id),
+    "/generate/model-animation": (d, id) => modelAnimationResult(d, id),
+    "/generate/model-sprites": (d, id) => spritesResult(d, id),
+    "/generate/asset-set": (d) => assetSetResult(d, "Asset set"),
+    "/generate/resize": (d, id) => resizeResult(d, id),
+    "/generate/match-palette": (d) => matchResult(d),
+  };
+
+  /** A finished job's stored result as its tool would have answered: by the route in its key, else by its shape. */
+  async function storedResult(job, result) {
+    const r = result && typeof result === "object" ? result : {};
+    const parsed = parseJobKey(job);
+    if (parsed && FORMAT[parsed.path]) return FORMAT[parsed.path](r, parsed.id);
+    // A key from an older release: read the result's shape.
+    if (Array.isArray(r.results)) return resultsContent(r, "Generation finished.");
+    if (Array.isArray(r.pieces) || Array.isArray(r.sheets)) return assetSetResult(r, "Asset set");
+    if (r.assetId && r.file) return assetResult(r, "Result");
+    if (Array.isArray(r.frames) && r.frames.length) {
+      return withGallery({ content: [{ type: "text", text: ["Done.", money(r)].filter(Boolean).join("\n") }, ...(await frameContent(r.frames))] },
+        r.frames.flatMap((f) => frameItems(f)), "Result");
+    }
+    return { content: [{ type: "text", text: `Done. Result:\n${JSON.stringify(result).slice(0, 4000)}` }] };
+  }
+
+  // ---------------------------------------------------------------------------
   // Gallery (MCP Apps): what the inline viewer shows. Hosts that support MCP Apps (claude.ai, the
   // Claude apps, ChatGPT) draw ui://voidless/gallery.html under the tool call and hand it the
   // result's structuredContent.gallery; others just read the text and the inline images.
@@ -706,28 +1052,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
     return { width: png.width, height: png.height, data: png.data };
   }
 
-  // Box-average downscale (keeps pixel art blocky when the factor is whole, smooth art clean otherwise).
-  function shrink(img, w, h) {
-    if (img.width === w && img.height === h) return img;
-    const out = Buffer.alloc(w * h * 4);
-    const sx = img.width / w, sy = img.height / h;
-    for (let y = 0; y < h; y++) {
-      const y0 = Math.floor(y * sy), y1 = Math.max(y0 + 1, Math.floor((y + 1) * sy));
-      for (let x = 0; x < w; x++) {
-        const x0 = Math.floor(x * sx), x1 = Math.max(x0 + 1, Math.floor((x + 1) * sx));
-        let r = 0, g = 0, b = 0, a = 0, n = 0;
-        for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) {
-          const i = (yy * img.width + xx) * 4, al = img.data[i + 3];
-          r += img.data[i] * al; g += img.data[i + 1] * al; b += img.data[i + 2] * al; a += al; n++;
-        }
-        const o = (y * w + x) * 4;
-        if (a) { out[o] = r / a; out[o + 1] = g / a; out[o + 2] = b / a; }
-        out[o + 3] = a / n;
-      }
-    }
-    return { width: w, height: h, data: out };
-  }
-
+  // The strip's cells use shrink (box average: keeps pixel art blocky when the factor is whole, smooth art clean otherwise).
   function encodeStrip(frames, cell) {
     const png = new PNG({ width: cell * frames.length, height: cell });
     frames.forEach((f, k) => {
@@ -735,6 +1060,26 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       for (let y = 0; y < cell; y++) s.data.copy(png.data, (y * png.width + k * cell) * 4, y * cell * 4, (y + 1) * cell * 4);
     });
     return PNG.sync.write(png, { colorType: 6 });
+  }
+
+  // An image given as a library key, a link or base64, as plain base64 for a route that takes only that. Keys and
+  // links are loaded with fetchFile, which on the hosted server reaches public addresses only.
+  const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+  async function imageBase64(input) {
+    const s = String(input || "").trim();
+    const named = /^https?:\/\//i.test(s) || /^assets\//.test(s);
+    if (!named) return s.replace(/^data:[^,]*,/, "");
+    const url = cdnUrl(s);
+    let res;
+    try {
+      res = await fetchFile(url);
+    } catch (err) {
+      throw new Error(`Could not load ${url}: ${err?.message || err}`);
+    }
+    if (!res.ok) throw new Error(`Could not load ${url} (${res.status}).`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_IMAGE_BYTES) throw new Error(`${url} is over ${MAX_IMAGE_BYTES / 1048576} MB.`);
+    return buf.toString("base64");
   }
 
   async function fetchPng(key) {
@@ -833,12 +1178,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       }
       // Finished before a server restart, with only a summary kept: point at the asset.
       if (st.result && st.result.restored) return { content: [{ type: "text", text: restoredText(st.result) }] };
-      const p = pending.get(job);
-      if (!p) {
-        // This connector restarted since the job began: the raw result is all there is.
-        return { content: [{ type: "text", text: `Done. Result:\n${JSON.stringify(st.result).slice(0, 4000)}` }] };
-      }
-      return replay.run({ path: p.path, result: st.result }, () => p.handler(p.args));
+      return storedResult(job, st.result);
     })
   );
 
@@ -876,7 +1216,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         meta.size ? `Size: ${meta.size}px · ${meta.dimension || ""} · style ${meta.style || "-"} · facing ${meta.facing || "-"}` : null,
         worldText(meta, frames),
         a.file ? `Base image: ${a.file}` : null,
-        meta.rigged_file ? `Rigged: yes (${(meta.animations || []).length} animations)` : null,
+        tilesetText(meta.tileset),
+        meta.rigged_file || meta.rigged_glb ? modelAnimationsText(meta.animations) : null,
         Array.isArray(meta.video_extensions) && meta.video_extensions.length
           ? `Video extensions: ${meta.video_extensions.map((v) => v.file).join(", ")}`
           : null,
@@ -896,26 +1237,42 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
   server.tool(
     "get_animation_presets",
     "List the animation-set presets (platformer-character, topdown-walk/run/dash/attack/idle) with the " +
-      "actions each one makes, and the credit cost per clip. Free.",
+      "actions each one makes, and the current price of an animation set. Free.",
     {},
     readTool("Get animation presets"),
     tool(async () => {
       const data = await apiGet("/generate/multi-animation/presets");
       const presets = (data.presets || []).map((p) => `- ${p.key} (${p.label}): ${p.actions.join(", ")}`);
-      const perClip = Number(data.pricePerClip) > 0 ? Number(data.pricePerClip) : 15;
-      const perHdClip = Number(data.pricePerHdClip) > 0 ? Number(data.pricePerHdClip) : 25;
-      const perHdRunClip = Number(data.pricePerHdRunClip) > 0 ? Number(data.pricePerHdRunClip) : 30;
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Presets:\n${presets.join("\n")}\n\n${perClip} credits per clip, ${perHdClip} for a 1024 HD image ` +
-              `(drawn at 1080P), ${perHdRunClip} for a looping walk/run on a 1024 HD image (a 2 s clip); ` +
-              "mirrored left-side clips are free. " +
-              `Up to ${data.maxImages} images per run.`,
-          },
-        ],
-      };
+      return { content: [{ type: "text", text: `Presets:\n${presets.join("\n")}\n\n${animationPriceText(data)}` }] };
+    })
+  );
+
+  server.tool(
+    "list_styles",
+    "List the user's saved styles: the art styles Voidless saved from style images they generated with (in the app " +
+      "or with generate_image's styleImage), newest first. Pass a style's id as generate_image's styleId to draw " +
+      "in it again, as picking it in the app does (styles are Voidless+ only). Free and read-only.",
+    {
+      page: z.number().int().min(1).default(1).describe("Page number, from 1 (default 1)"),
+      pageSize: z.number().int().min(1).max(50).default(20).describe("Styles per page, 1-50 (default 20)"),
+    },
+    readTool("List saved styles"),
+    tool(async ({ page, pageSize }) => {
+      const data = await apiGet(`/styles?sort=createdAt:desc&pagination[page]=${page}&pagination[pageSize]=${pageSize}`);
+      const styles = (data.data || []).map((item) => ({ id: item.id, ...(item.attributes || item) }));
+      const rows = styles.map((s) => {
+        const words = String(s.prompt || "").replace(/\s+/g, " ").trim();
+        const url = cdnUrl(s.file);
+        return `- ${s.id} · "${words.length > 140 ? `${words.slice(0, 140)}…` : words || "(no description yet)"}"` +
+          (url ? ` · ${url}` : "");
+      });
+      const p = data.meta?.pagination;
+      const footer = p ? `\nPage ${p.page} of ${p.pageCount} (${p.total} styles)` : "";
+      const text = styles.length
+        ? `Saved styles (generate_image styleId):\n${rows.join("\n")}${footer}`
+        : "No saved styles yet. One is saved the first time an image is generated with a style image.";
+      const items = styles.map((s) => mediaItem(s.file, `Style ${s.id}`));
+      return withGallery({ content: [{ type: "text", text }] }, items, "Saved styles");
     })
   );
 
@@ -1002,9 +1359,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       "save_as 'assets' (each cut-out a 1024 sprite). Call it once per request and " +
       "show the result; ask the user before generating again (each call spends credits). Every image is drawn in " +
       "exactly one of Voidless's fixed style presets, and the result says which one was used and why. " +
-      "Model 'free' is not AI: procedural pixel art drawn by code (item icons and loot sheets, RPG characters in 8 directions " +
-      "with animations, trees, plants and rocks), instant, 0 credits; use it only when the user asks for free or procedural " +
-      "pixel art or a quick placeholder, never by default (options in `free`).",
+      `Model 'free' is not AI: procedural pixel art drawn by code (free.kind: ${FREE_KINDS.join(", ")}), instant, 0 credits; ` +
+      "use it only when the user asks for free or procedural pixel art or a quick placeholder, never by default (options in `free`).",
     {
       prompt: z
         .string()
@@ -1033,7 +1389,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       size: sizeSchema(...PIXEL_SIZES, TILESET_SHEET_SIZE, 512, 768, 1024, 2048, "4k")
         .default(512)
         .describe(
-          "Output px. 32, 48, 64, 96, 128, 192, 256 and 384 give pixel art; 512 for every other style; 768 for a sharper smooth sprite (drawn at 1024, stored at 768); 1024 for high-res. " +
+          "Output px. 32, 48, 64, 96, 128, 192, 256 and 384 give pixel art; 512 for every other style; 768 for a sharper smooth sprite (drawn at 1024, stored at 768); 1024 for high-res (Voidless+ only, as are 2048 and '4k'). " +
             "144 is ONLY for type 'tileset' with tilesetKind 'platformer' (the side-view 3x3 sheet): nine 48 px pixel-art tiles (96 gives 32 px tiles, 192 gives 64 px). 2048 and '4k' are " +
             "ASSET-SHEET sizes, only for type 'artwork' with model 'gpt-image-2.6' in a smooth (not pixel) style: 2048 = " +
             "2048x2048 (aspect '16:9': 2560x1440), '4k' = 2880x2880 (aspect '16:9': 3840x2160), kept at that size. For a " +
@@ -1060,14 +1416,17 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
             "forest, desert, candy and cyberpunk set the mood and cap the colours (12-16). Edits, rotations and " +
             "animations of the asset keep its palette. There is no colour-count setting: Voidless picks it by size."
         ),
-      facing: z.enum(["forward", "right"]).default("forward").describe("Characters: front view or side profile. Side profiles rotate best."),
+      facing: z.enum(["forward", "right"]).default("forward").describe(
+        "Characters in '2d' or 'isometric': front view or side profile. Side profiles rotate best. Not used for " +
+          "dimension 'top down' (drawn from above whatever the facing), where it is left out"
+      ),
       pose: z
         .enum(["idle", "tpose"])
         .default("idle")
         .describe(
           "Characters, front or side view: 'idle' = relaxed stance with the arms down — the default, for animation " +
             "sets, rotations and almost everything. 'tpose' = arms held straight out — ONLY when the user asks for a " +
-            "T-pose (e.g. to rig the character in the skeleton editor)."
+            "T-pose (e.g. to rig the character in the skeleton editor). Not used for dimension 'top down', where it is left out."
         ),
       bodyType: z.enum(["humanoid", "quadruped"]).default("humanoid").describe("Characters: body plan"),
       tilesetKind: z
@@ -1088,12 +1447,12 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         .default("graphic")
         .describe("type 'ui' only: 'graphic' = button/panel/HUD piece, 'title' = game-title wordmark spelling the prompt, 'text' = plain label spelling the prompt"),
       seed: z.number().int().min(0).default(0).describe("RNG seed (0 = random)"),
-      referenceImage: z.string().default("").describe("Optional raw base64 image (no data: prefix) to base the result on"),
+      referenceImage: z.string().default("").describe("Voidless+ only. Optional raw base64 image (no data: prefix) to base the result on"),
       styleImage: z
         .string()
         .default("")
         .describe(
-          "Optional image whose art style to copy: an image key from one of your assets (get_asset lists them, e.g. " +
+          "Voidless+ only. Optional image whose art style to copy: an image key from one of your assets (get_asset lists them, e.g. " +
             "assets/64/images/<id>.png) or its cdn.voidless.dev URL. The server loads it at full resolution. Prefer " +
             "this (or styleAssetId) over base64: get_image_data only returns a small thumbnail. With gpt-image-2.6 " +
             "the picture itself is shown to the model; other models get a description of its style"
@@ -1102,11 +1461,16 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         .number()
         .int()
         .optional()
-        .describe("Optional: the id of one of your image assets whose art style to copy (its main image, full resolution). Same as passing its image key as styleImage"),
+        .describe("Voidless+ only. Optional: the id of one of your image assets whose art style to copy (its main image, full resolution). Same as passing its image key as styleImage"),
+      styleId: z
+        .number()
+        .int()
+        .optional()
+        .describe("Voidless+ only. Optional: one of your saved styles (list_styles gives their ids), the same as picking it in the app. Leave styleImage and styleAssetId empty with it"),
       free: freeOptions,
     },
     writeTool("Generate image"),
-    tool(async ({ facing, pose, bodyType, palette, uiMode, tilesetKind, aspect, styleAssetId, free, ...rest }) => {
+    tool(async ({ facing, pose, bodyType, palette, uiMode, tilesetKind, aspect, styleAssetId, styleId, free, ...rest }) => {
       // Model "free": drawn by code before anything is checked or sent, so no credits and no API call.
       if (rest.model === "free") {
         if (!server.voidlessFreeImage) {
@@ -1147,10 +1511,19 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       }
       // Tilesets are GPT-Image only (the server enforces it too); the kind rides in options.mode.
       if (tileset) rest.model = "gpt-image-2.5";
-      const mode = tileset ? tilesetKind || "" : uiMode;
-      const body = { ...rest, palette: [], options: { facing, pose, bodyType, palette, mode, aspect: wide }, ...styleRef(rest.styleImage, styleAssetId) };
-      const data = await apiPost("/generate/image", body);
-      return assetResult(data, "Image", [styleLine(data)]);
+      // options.mode is the tileset layout or the UI mode, and empty for every other type, as the app sends it.
+      const mode = tileset ? tilesetKind || "" : rest.type === "ui" ? uiMode : "";
+      // A top-down character is drawn from above: facing and pose don't apply and are not sent (the server
+      // would otherwise store a "right" the picture doesn't have).
+      const framing = rest.dimension === "top down" ? {} : { facing, pose };
+      // A saved style is its own words: the server reads them from styleId when no style text comes with it.
+      if (Number.isInteger(styleId)) rest.style = "";
+      const body = {
+        ...rest, palette: [], options: { ...framing, bodyType, palette, mode, aspect: wide },
+        ...styleRef(rest.styleImage, styleAssetId),
+        ...(Number.isInteger(styleId) ? { styleId } : {}),
+      };
+      return imageResult(await apiPost("/generate/image", body));
     })
   );
 
@@ -1168,10 +1541,13 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       frameId,
       images: z.array(z.string()).max(4).default([]).describe("Optional extra reference images: image keys from any of your assets (get_asset lists them), or their cdn.voidless.dev URLs. Other links are refused: upload the picture first"),
       remove_bg: z.boolean().default(true).describe("Remove the background from the result, as the app's editor does. Set false for artwork or a scene that should keep its background"),
+      model: z.enum(["p-image", "gpt-image-2.5", "flux2-klein"]).default("p-image").describe(
+        "The edit model, as the app's Edits setting offers (same price, 5 credits): p-image (default, the app's " +
+          "editor), gpt-image-2.5 or flux2-klein. Only when the user names one"
+      ),
     },
     writeTool("Edit image"),
-    // Always the app's own editor, the same one as the editor's "Edit this image" box.
-    tool(async (args) => framesResult(await apiPost("/generate/image-edit", { ...args, model: "p-image" }), args.id, "Edit"))
+    tool(async (args) => framesResult(await apiPost("/generate/image-edit", args), args.id, "Edit"))
   );
 
   server.tool(
@@ -1268,32 +1644,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
     writeTool("Extract sprite parts"),
     tool(async (args) => {
       const data = await apiPost("/generate/image-parts", args);
-      if (args.save_as === "assets") {
-        const assets = Array.isArray(data.assets) ? data.assets : [];
-        const lines = [
-          `Saved ${assets.length} item${assets.length === 1 ? "" : "s"} from asset ${args.id} as new assets:`,
-          ...assets.map((a) => `#${a.id} ${a.prompt} (${a.image_type}) · ${APP_URL}/asset/${a.id}`),
-          money(data),
-        ].filter(Boolean);
-        const content = [{ type: "text", text: lines.join("\n") }];
-        for (const a of assets.slice(0, MAX_INLINE_IMAGES)) {
-          const image = await inlineImage(a.file);
-          if (image) content.push(image);
-        }
-        const items = assets.map((a) => mediaItem(a.file, `#${a.id} ${a.prompt || ""}`.trim(), { link: `${APP_URL}/asset/${a.id}` }));
-        return withGallery({ content }, items, "Items");
-      }
-      // The ids returned here are off by (parts - 1): the server numbers from the last appended
-      // frame. Point at get_asset instead of printing ids that would misdirect a follow-up call.
-      const names = (data.frames || []).map((f) => f.name).filter(Boolean);
-      return withGallery({
-        content: [
-          {
-            type: "text",
-            text: `Extracted ${names.length} parts from asset ${args.id}: ${names.join(", ")}.\n${money(data)}\nUse get_asset ${args.id} for their frame ids and image keys.`,
-          },
-        ],
-      }, (data.frames || []).flatMap((f) => frameItems(f, args.id)), "Parts");
+      return partsResult(args.save_as === "assets" ? { ...data, assets: Array.isArray(data.assets) ? data.assets : [] } : data, args.id);
     })
   );
 
@@ -1387,7 +1738,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       url: z.string().optional().describe("Public http(s) link to the image. Preferred: a long base64 string is easy to garble. Give url or image, not both"),
       image: z.string().optional().describe("Base64 image instead of url (a data: prefix is stripped automatically). Give url or image, not both"),
       type: z
-        .enum(["object", "character", "character portrait", "artwork"])
+        .enum(["object", "character", "character portrait", "artwork", "tileset", "ui"])
         .default("character")
         .describe("What the picture is (default 'character'), with the same meanings as generate_image's type"),
       remove_bg: z.boolean().default(false).describe("Remove the background on upload (default false). Set true for a sprite on a solid background"),
@@ -1407,13 +1758,17 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       "clean_up_sprite (saved, background removed); for a Voidless asset with its animations use resize_sprite (free). " +
       "1 credit on every call (each call bills again).",
     {
-      image: z.string().describe("Base64 source image (a data: prefix is stripped automatically). There is no URL option"),
+      image: z.string().describe(
+        "The source image: an image key from one of your assets (as get_asset lists it), a public http(s) link " +
+          "(a cdn.voidless.dev URL works), or base64 (a data: prefix is stripped automatically). Prefer a key or a link: " +
+          "a long base64 string is easy to garble"
+      ),
       size: sizeSchema(...PIXEL_SIZES, 512, 768, 1024).default(64)
         .describe(`Output size in px (square, default 64): ${PIXEL_SIZE_TEXT}, or 512 and 1024, drawn on a real 4x grid (128 / 256 art pixels). Smaller sizes give chunkier pixels and fewer colours`),
     },
     writeTool("Pixelate image"),
     tool(async ({ image, ...rest }) => {
-      const data = await apiPost("/pixelate/image", { image: String(image).replace(/^data:[^,]*,/, ""), ...rest });
+      const data = await apiPost("/pixelate/image", { image: await imageBase64(image), ...rest });
       return withGallery({
         content: [
           { type: "text", text: money(data) || "Pixelated." },
@@ -1536,8 +1891,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       "'name: description' separated by semicolons names each clip (e.g. 'attack-2: an overhead slash; block: " +
       "raise the sword to guard'); for one image a plain 'idle, run, jump' also works. Several actions on several " +
       "images: every image gets every action.\n" +
-      "Cost: 15 credits per clip, 25 per clip of a 1024 HD image (drawn at 1080P), 30 per looping walk/run clip " +
-      "(walk, stroll, march, sneak, tiptoe, patrol, run, jog, sprint, dash, a charge forward) of a 1024 HD image; mirrored clips are free and " +
+      "Cost: see get_animation_presets for the current price (per clip: 15 credits, 25 for a 1024 HD image, 30 for " +
+      "a looping walk/run on one); the plan below states the exact total. Mirrored clips are free and " +
       "clips that fail are refunded. Clips that come back to " +
       "their start (idle, walk, run, attack, jump, hurt, dash) end on their own first frame, so they loop; one-off " +
       "clips such as a death do not. Clips are added to their source asset as frames named after the action.\n" +
@@ -1552,6 +1907,30 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         .optional()
         .describe("Named set of actions (see get_animation_presets)"),
       prompt: z.string().default("").describe("Without a preset: the actions to make, as 'name: description' separated by semicolons. With one: optional extra direction for every clip"),
+      facings: z.enum(["rotation"]).optional().describe(
+        "'rotation' with ONE item and a topdown-* preset: run it on that sprite's 8-way rotation (its newest, or the " +
+          "item's frameIndex), one clip per facing with the left side mirrored, as the app's Animation set does with " +
+          "nothing picked. Saves listing every facing as an item (way 2). Without it a top-down preset on one image " +
+          "draws every heading from that one view"
+      ),
+      ways: z.union([z.literal(8), z.literal(4)]).optional().describe("With facings 'rotation': 8 facings (default) or the 4 cardinals"),
+      slotEnds: z
+        .array(z.union([
+          z.string(),
+          z.null(),
+          z.object({
+            frameIndex: z.number().int().optional(),
+            imageIndex: z.number().int().optional(),
+            base: z.boolean().optional(),
+          }),
+        ]))
+        .max(12)
+        .optional()
+        .describe(
+          "Optional end frame per item, in items' order: an image key from any of your assets (get_asset lists " +
+            "them) or its cdn.voidless.dev URL, or {frameIndex, imageIndex} / {base: true} on that item's own asset; null " +
+            "= the default ending. The clip ends on that pose"
+        ),
       holdFacing: z.boolean().default(false).describe("End every clip on the frame it started from, even one-off clips such as a death (by default loops end on their start and one-offs don't)"),
       flipFacings: z.boolean().default(true).describe("On an 8-way rotation set, mirror the left-side clips from the right-side ones instead of animating them (mirrored clips are free). One-sided details swap sides, as on the rotation images"),
       autoFlip: z.boolean().default(false).describe("After the run, mirror every right-side clip on the asset that has no left twin (animate only the right-facing turns, get all eight). Free"),
@@ -1561,6 +1940,10 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
     },
     writeTool("Generate animation set"),
     tool(async (args) => {
+      if (args.facings === "rotation" && (args.items.length !== 1 || !String(args.preset || "").startsWith("topdown-"))) {
+        throw new Error("facings 'rotation' takes ONE item and a topdown-* preset (the sprite's rotation set is run facing by facing).");
+      }
+      if (args.ways && args.facings !== "rotation") throw new Error("ways goes with facings 'rotation'.");
       if (args.expectedCost === undefined || args.expectedCost === null) {
         const plan = await api("POST", "/generate/multi-animation", { ...args, planOnly: true });
         return { content: [{ type: "text", text: animationPlanText(plan) }] };
@@ -1606,28 +1989,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         .describe(`New size in px: ${PIXEL_SIZE_TEXT}. Omit to keep the size (required for an HD image)`),
     },
     writeTool("Resize sprite"),
-    tool(async ({ id, size }) => {
-      const data = await apiPost("/generate/resize", { assetId: id, size });
-      const asset = data.asset || {};
-      const md = asset.meta_data || {};
-      const link = `${APP_URL}/asset/${asset.id}`;
-      const skipped = Array.isArray(data.skipped) ? data.skipped : [];
-      const lines = [
-        `Resized asset ${id} into a new asset: ${md.size} px, ${md.colours} colours. The original is unchanged. Free.`,
-        `Asset ID: ${asset.id} · ${link}`,
-        Array.isArray(data.palette) && data.palette.length ? `Palette: ${data.palette.join(" ")}` : null,
-        skipped.length ? `${skipped.length} frame set(s) were left out: ` +
-          skipped.map((x) => (x && typeof x === "object" ? `${x.name || `frame ${x.id}`} (${x.reason || "no stored renders"})` : `frame ${x}`)).join("; ") +
-          "." : null,
-      ].filter(Boolean);
-      const content = [{ type: "text", text: lines.join("\n") }];
-      const frames = (md.frames || []).filter((f) => !f.archived);
-      if (frames.length) content.push({ type: "text", text: "Frames:\n" + frames.map(frameLine).join("\n") });
-      const image = await inlineImage(asset.file);
-      if (image) content.push(image);
-      const items = [mediaItem(asset.file, "Resized", { link }), ...frames.flatMap((f) => frameItems(f, asset.id))];
-      return withGallery({ content }, items, "Resized");
-    })
+    tool(async ({ id, size }) => resizeResult(await apiPost("/generate/resize", { assetId: id, size }), id))
   );
 
   server.tool(
@@ -1646,24 +2008,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       lead: z.number().int().optional().describe("One of ids whose own colours are kept exactly; the others follow it"),
     },
     writeTool("Match palette"),
-    tool(async ({ ids, colours, palette, lead }) => {
-      const data = await apiPost("/generate/match-palette", { assetIds: ids, colours, palette, leadAssetId: lead });
-      const assets = Array.isArray(data.assets) ? data.assets : [];
-      const shared = Array.isArray(data.palette) ? data.palette : [];
-      const lines = [
-        `Matched ${assets.length} sprite${assets.length === 1 ? "" : "s"} on one ${shared.length}-colour palette. Originals unchanged. Free.`,
-        ...assets.map((a) => `Asset ${a.meta_data?.derived_from?.assetId} -> new asset ${a.id} · ${APP_URL}/asset/${a.id}`),
-        `Palette: ${shared.join(" ")}`,
-        Array.isArray(data.skipped) && data.skipped.length ? `Not matched: ${data.skipped.join(", ")}` : null,
-      ].filter(Boolean);
-      const content = [{ type: "text", text: lines.join("\n") }];
-      for (const a of assets.slice(0, MAX_INLINE_IMAGES)) {
-        const image = await inlineImage(a.file);
-        if (image) content.push(image);
-      }
-      const items = assets.map((a) => mediaItem(a.file, `#${a.id}`, { link: `${APP_URL}/asset/${a.id}` }));
-      return withGallery({ content }, items, "Palette matched");
-    })
+    tool(async ({ ids, colours, palette, lead }) =>
+      matchResult(await apiPost("/generate/match-palette", { assetIds: ids, colours, palette, leadAssetId: lead })))
   );
 
   // ---------------------------------------------------------------------------
@@ -1743,11 +2089,14 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
             "https URLs, or data: URIs"
         ),
       duration: z.number().int().min(4).max(15).default(4).describe("Clip length in seconds, 4-15 (default 4). Cost is 15 credits per second"),
-      width: z.number().int().default(1280).describe("Width in px (default 1280). With height it sets the aspect: 1280x720 = 16:9 landscape, 720x1280 = 9:16 portrait"),
-      height: z.number().int().default(720).describe("Height in px (default 720). See width"),
+      aspect: videoAspect,
     },
     writeTool("Generate video"),
-    tool(async (args) => assetResult(await apiPost("/generate/video", args), "Video"))
+    tool(async ({ aspect, images, ...args }) => {
+      // Image keys as their links (the video service downloads them); URLs and data: URIs as they are.
+      const refs = images.map((r) => (/^data:/.test(r) ? r : cdnUrl(r) || r));
+      return assetResult(await apiPost("/generate/video", { ...args, images: refs, ...VIDEO_SIZES[aspect] }), "Video");
+    })
   );
 
   server.tool(
@@ -1768,25 +2117,30 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
             "Empty (default) = the latest extension, or the original clip if it has none"
         ),
       duration: z.number().int().min(4).max(15).default(4).describe("Length of the new clip in seconds, 4-15 (default 4). Cost is 15 credits per second"),
-      width: z.number().int().default(1280).describe("Width in px (default 1280). Match the clip being continued: 1280x720 for 16:9, 720x1280 for 9:16"),
-      height: z.number().int().default(720).describe("Height in px (default 720). See width"),
+      aspect: videoAspect.describe("The clip's shape, as the app's video editor offers: '16:9' (864x496, default) or '9:16' (496x864). Match the clip being continued"),
+      images: z.array(z.string()).max(7).optional().describe(
+        "Reference images for the characters and style (image keys from get_asset or https URLs, up to 7). Default: " +
+          "the video's own references, as the app's editor sends them (its editor references, else the images it " +
+          "was generated from). The clip continues from the video's last frame"
+      ),
     },
     writeTool("Extend video"),
-    tool(async ({ video, ...args }) => {
+    tool(async ({ video, aspect, images, ...args }) => {
+      const asset = await apiGet(`/assets/${args.assetId}`);
+      const md = asset.meta_data || {};
       let source = video;
       if (!source) {
-        const asset = await apiGet(`/assets/${args.assetId}`);
-        const extensions = asset.meta_data?.video_extensions || [];
+        const extensions = md.video_extensions || [];
         source = extensions.length ? extensions[extensions.length - 1].file : asset.file;
       }
-      const data = await apiPost("/generate/video-extend", { ...args, video: source, images: [] });
-      const clips = (data.videos || []).map((v) => `- ${cdnUrl(v.file)}`).join("\n");
-      const link = `${APP_URL}/asset/${args.assetId}`;
-      return withGallery(
-        { content: [{ type: "text", text: `Extended video ${args.assetId}:\n${clips}\n${money(data)}` }] },
-        (data.videos || []).map((v, i) => mediaItem(v.file, `Extension ${i + 1}`, { link })),
-        "Video extended"
-      );
+      const refs = images && images.length ? images : videoReferences(md);
+      // As links, as the app sends them: the video service downloads the clip's last frame and the references.
+      const body = {
+        ...args, video: cdnUrl(source) || source,
+        images: refs.map((r) => (/^data:/.test(r) ? r : cdnUrl(r))).filter(Boolean).slice(0, 7),
+        ...VIDEO_SIZES[aspect],
+      };
+      return extendResult(await apiPost("/generate/video-extend", body), args.assetId);
     })
   );
 
@@ -1796,14 +2150,28 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
 
   server.tool(
     "generate_3d_model",
-    "Generate a textured 3D model from a text prompt as a GLB file, saved as a new model asset in the user's " +
+    "Generate a textured 3D model as a GLB file, from a text prompt or from one of the user's images (image_id: " +
+      "the app's Convert to 3D, the image and the model linked), saved as a new model asset in the user's " +
       "Voidless library. For a model the user already has use upload_3d_model; for a 2D sprite use generate_image. " +
       "45 credits for mode 'game' or 15 for an 'lq' draft, charged on every call and refunded if it fails; a slow run " +
       "returns a job for check_generation. Returns the asset ID, the GLB link, a thumbnail and the seed; a character " +
       "goes on to rig_3d_model, then animate_3d_model and render_3d_sprites.",
     {
-      prompt: z.string().describe("The single model to make, with its shape, materials and colours, e.g. 'wooden treasure chest with iron bands'"),
-      type: z.enum(["object", "character"]).default("object").describe("'character' makes a T-posed figure ready for rigging"),
+      prompt: z.string().default("").describe(
+        "The single model to make, with its shape, materials and colours, e.g. 'wooden treasure chest with iron bands'. " +
+          "Required without image_id; with one it is optional (default: the image's own prompt)"
+      ),
+      image_id: z.number().int().optional().describe(
+        "Build the model from one of your image assets instead of drawing a reference (its picture is cut out and used " +
+          "as it is). The model is linked to the image, so sprites rendered from it go back onto that image"
+      ),
+      source_file: z.string().optional().describe(
+        "With image_id: which picture of it, an image key of that asset as get_asset lists it (an edit, or one view " +
+          "of a rotation set). Default: the image itself"
+      ),
+      type: z.enum(["object", "character"]).optional().describe(
+        "'character' makes a T-posed figure ready for rigging (default 'object'; with image_id, from the image's own type)"
+      ),
       style: z.string().default("low-poly").describe(
         "'low-poly' (default: faceted triangles, flat colours), 'blocky' (voxel art, built from cubes), 'claymation', 'origami', " +
           "'hand-painted' (stylized fantasy) or 'toy' (glossy vinyl figure)"
@@ -1811,13 +2179,33 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       mode: z.enum(["game", "lq", "hq"]).default("game").describe(
         "game = game-ready, a light clean mesh of about 19k triangles (45 credits); lq = draft (15 credits). hq is an old name for game"
       ),
-      bodyType: z.enum(["humanoid", "quadruped"]).default("humanoid").describe("type 'character' only: the body plan (default humanoid). Ignored for objects"),
+      bodyType: z.enum(["humanoid", "quadruped"]).optional().describe(
+        "type 'character' only: the body plan (default humanoid; with image_id, the image's own). Ignored for objects"
+      ),
+      palette: z.enum(["none", "black-and-white", "retro", "vibrant", "pastel", "neon", "earthy", "gameboy", "sepia"]).default("none")
+        .describe("Colour scheme of the model's texture, as the app's 3D generator offers (default none: the prompt's own colours)"),
       seed: z.number().int().min(0).default(0).describe("RNG seed (0 = random, the default). The result reports the seed used"),
     },
     writeTool("Generate 3D model"),
-    tool(async ({ bodyType, ...rest }) => {
-      const options = rest.type === "character" ? { pose: "tpose", bodyType } : {};
-      return assetResult(await apiPost("/generate/3d-model", { ...rest, options }), "3D model");
+    tool(async ({ bodyType, palette, image_id, source_file, type, ...rest }) => {
+      const prompt = String(rest.prompt || "").trim();
+      const fromImage = Number.isInteger(image_id);
+      if (!fromImage && !prompt) throw new Error("Give a prompt, or image_id to build the model from one of your images.");
+      if (source_file && !fromImage) throw new Error("source_file picks a picture of image_id's asset: give image_id too.");
+      // With an image the server reads its type and body plan unless they are given (helpers in model.js).
+      const kind = type || (fromImage ? undefined : "object");
+      const options = {
+        ...(kind === "character" ? { pose: "tpose", bodyType: bodyType || "humanoid" } : {}),
+        ...(kind !== "character" && fromImage && bodyType ? { bodyType } : {}),
+        ...(palette && palette !== "none" ? { palette } : {}),
+      };
+      const body = {
+        ...rest, prompt, options,
+        ...(kind ? { type: kind } : {}),
+        ...(fromImage ? { image_id, ...(source_file ? { source_file } : {}) } : {}),
+      };
+      return assetResult(await apiPost("/generate/3d-model", body), "3D model",
+        fromImage ? [`Built from image asset ${image_id}${source_file ? ` (${source_file})` : ""}, and linked to it.`] : []);
     })
   );
 
@@ -1853,10 +2241,7 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       id: z.number().int().describe("3D model asset ID"),
     },
     writeTool("Rig 3D model"),
-    tool(async (args) => {
-      const data = await apiPost("/generate/model-rig", args);
-      return { content: [{ type: "text", text: `Rigged model ${args.id}: ${cdnUrl(data.rigged_glb || data.rigged_file)}\n${money(data)}` }] };
-    })
+    tool(async (args) => rigResult(await apiPost("/generate/model-rig", args), args.id))
   );
 
   server.tool(
@@ -1865,7 +2250,8 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       "punch, kick, wave, hurt, death, cast, dance; four-legged animals: idle, walk, run, jump, attack, sit, hurt, " +
       "death), a move copied from another of the user's rigged models (free: from_id + from_animation), or a " +
       "description of any motion ('wag its tail', 'open the lid', 20 credits). Returns the clip, a GLB of the " +
-      "skeleton's motion that plays on the rigged model.",
+      "skeleton's motion that plays on the rigged model, and its animation id (render_3d_sprites' animation, " +
+      "from_animation when copying it); get_asset on the model lists every animation's id.",
     {
       id: z.number().int().describe("Rigged 3D model asset ID"),
       preset: z.string().optional().describe("Ready-made move id, e.g. 'walk' (free)"),
@@ -1875,22 +2261,17 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
       duration: z.number().int().min(1).max(10).optional().describe("Whole seconds (1-10), for a described motion (default: its natural length)"),
     },
     writeTool("Animate 3D model"),
-    tool(async (args) => {
-      const data = await apiPost("/generate/model-animation", args);
-      const anim = data.animation || {};
-      return {
-        content: [{ type: "text", text: `Animation "${anim.name || args.prompt}" on model ${args.id}: ${cdnUrl(anim.file)}\n${money(data)}` }],
-      };
-    })
+    tool(async (args) => modelAnimationResult(await apiPost("/generate/model-animation", args), args.id, args.prompt))
   );
 
   server.tool(
     "render_3d_sprites",
     "Render a 3D model as 2D game sprites: one of its moves (from animate_3d_model) or the model standing, " +
       "seen from 8 directions, 4, the two sides of a platformer, 4 isometric diagonals, or the front. 16 frames " +
-      "by default, at 32-512 px (pixel art up to 128, from the same pass as generated sprites; smooth above). Saved as an " +
-      "animated sprite asset linked to the model, one animation per direction, ready to export as a sheet or " +
-      "edit. Every render of the same model goes onto that one asset. Free.",
+      "by default, at 32-512 px (pixel art up to 128, from the same pass as generated sprites, each clip steadied as " +
+      "they are; smooth above). Saved as an animated sprite asset linked to the model, one animation per direction, " +
+      "ready to export as a sheet or edit. Every render of the same model goes onto that one asset, and rendering " +
+      "a move again replaces its earlier render (same frame ids) instead of adding a second copy. Free.",
     {
       id: z.number().int().describe("3D model asset ID"),
       animation: z
@@ -1901,31 +2282,15 @@ export function createVoidlessServer(API_KEY, transport = "stdio", { fetchFile =
         .enum(["eight", "four", "platformer", "isometric", "front"])
         .default("eight")
         .describe("Which views: 8 around, 4 (down/right/up/left), platformer (right, left, side-on), isometric diagonals, or the front"),
-      size: z
-        .union([z.literal(32), z.literal(64), z.literal(128), z.literal(256), z.literal(512)])
+      size: sizeSchema(32, 48, 64, 96, 128, 256, 512)
         .default(128)
-        .describe("Sprite size in pixels: 32-128 come out as pixel art, 256 and 512 as smooth renders"),
+        .describe("Sprite size in pixels: 32, 48, 64, 96 and 128 come out as pixel art, 256 and 512 as smooth renders"),
       frames: z.number().int().min(2).max(32).default(16).describe("Frames per direction (default 16)"),
+      angle: z.union([z.literal(30), z.literal(0)]).optional()
+        .describe("Camera angle above the ground: 30 (a game's 3/4 view) or 0 (side-on). Default: 0 for platformer, 30 otherwise"),
     },
     writeTool("Render 3D sprites"),
-    tool(async (args) => {
-      const data = await apiPost("/generate/model-sprites", args);
-      const asset = await apiGet(`/assets/${data.assetId}`).catch(() => null);
-      const name = String(data.animation?.name || "still").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-      const made = ((asset?.meta_data?.frames) || [])
-        .filter((f) => f && f.type === "animation" && String(f.name || "").startsWith(`${name}-`))
-        .slice(-(data.directions || []).length || undefined);
-      const head = [
-        `${data.animation ? `"${data.animation.name}"` : "The model standing"} rendered from 3D: ` +
-          `${(data.directions || []).length} direction${(data.directions || []).length === 1 ? "" : "s"} ` +
-          `(${(data.directions || []).join(", ")}), ${data.frameCount} frame${data.frameCount === 1 ? "" : "s"} each at ${data.size} px, ${data.fps} fps.`,
-        `${data.added ? "Added to" : "Saved as"} sprite asset ${data.assetId} (${APP_URL}/asset/${data.assetId}), linked to model ${args.id}.`,
-        money(data),
-      ].filter(Boolean).join("\n");
-      const content = [{ type: "text", text: head }];
-      if (made.length) content.push(...(await frameContent(made)));
-      return withGallery({ content }, made.flatMap((f) => frameItems(f, data.assetId)), "3D sprites");
-    })
+    tool(async (args) => spritesResult(await apiPost("/generate/model-sprites", args), args.id))
   );
 
   // The inline gallery, and the tools whose results it shows.
